@@ -1,0 +1,47 @@
+# ---------------------------------------------------------------
+# 起動:  docker compose up -d --build
+# 画面:  http://<このPCまたはNASのIP>:8501
+# ---------------------------------------------------------------
+name: rag-translation
+
+services:
+  db:
+    build:
+      context: .
+      dockerfile: Dockerfile.db
+    image: rag-translation-db
+    container_name: tm-pg
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: tm
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?.env に POSTGRES_PASSWORD を設定してください}
+      POSTGRES_DB: tm
+    volumes:
+      - tm-pgdata:/var/lib/postgresql/data
+    # ホストから ingest.py や psql で直接つなぐ場合用（同じPC内からのみ接続可）
+    ports:
+      - "127.0.0.1:${DB_PORT:-5432}:5432"
+    shm_size: 256mb
+    healthcheck:
+      # -h localhost で TCP 確認 = 初期化（schema.sql 実行）完了後の本番サーバー起動を待つ
+      test: ["CMD-SHELL", "pg_isready -U tm -d tm -h localhost"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  app:
+    build: .
+    image: rag-translation-app
+    container_name: tm-app
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      TM_DATABASE_URL: postgresql://tm:${POSTGRES_PASSWORD}@db:5432/tm
+    ports:
+      - "${APP_PORT:-8501}:8501"
+
+volumes:
+  tm-pgdata:

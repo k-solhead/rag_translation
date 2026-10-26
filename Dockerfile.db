@@ -1,0 +1,8 @@
+# ---------------------------------------------------------------
+# PostgreSQL 16 + pgvector + pg_trgm（schema.sql を同梱）
+#   schema.sql はイメージに焼き込むため、ファイルのマウント漏れで
+#   「Is a directory」エラーになることがない
+#   ※環境差をなくしたい場合は pgvector/pgvector:0.8.x-pg16 のように固定する
+# ---------------------------------------------------------------
+FROM pgvector/pgvector:pg16
+COPY schema.sql /docker-entrypoint-initdb.d/01-schema.sql

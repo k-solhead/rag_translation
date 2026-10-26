@@ -1,0 +1,6 @@
+psycopg[binary]>=3.1
+pgvector>=0.3
+numpy
+sentence-transformers>=2.7
+openpyxl>=3.1
+streamlit>=1.35
