@@ -1,260 +1,352 @@
-"""過去翻訳データの一括投入スクリプト（英文のベクトル化を含む）。
- 
-入力 CSV（UTF-8 / BOM 付き可）または Excel（先頭シート）の列:
-    doc_key    必須  文書を一意に識別するキー（案件番号・ファイル名など）
-    title      任意  文書名
-    page_no    任意  ページ番号（整数）
-    source_en  必須  英文
-    target_ja  必須  和訳
- 
-使い方:
-    python ingest.py data.csv
-    python ingest.py data.csv --defer-index      # 初回の大量投入時（HNSW を投入後に作り直す）
-    python ingest.py data.csv --allow-duplicates # 同一文書内の同一英文・同一訳も重複登録する
- 
-処理の流れ:
-    1. CSV を読み込み、正規化・検証
-    2. documents を UPSERT して doc_key → id を取得
-    3. 英文を重複排除してからベクトル化（同じ文が多いマニュアル類で大幅に時短）
-    4. 一時テーブルへ COPY（バイナリ）→ 重複を除いて segments へ INSERT
+"""対訳表の一括投入（英文・和文の両方をベクトル化して1回で登録）。
+
+入力ファイル
+    Excel（.xlsx）: idml2xlsx の対訳表をそのまま使える
+        - 「対訳表」シート（無ければ先頭シート）を読む
+        - 「文書情報」シート（A列=項目、B列=値）があれば文書情報として使う
+            案件名 / ファイル名 / 顧客名 / タグ / メモ
+    CSV（UTF-8 / BOM 付き可）
+
+対訳の列（いずれかの列名があればよい）
+    英文      : en_text / 英語 / 英文 / source_en
+    和文      : ja_text / 日本語 / 和文 / target_ja
+    英ページ  : page_en / ページ(英)   … 任意。「p.12」のような表記も可
+    和ページ  : page_ja / ページ(日)   … 任意
+    共通ページ: page_no / ページ        … 任意（上の2列が無いときに両方へ使う）
+    文書キー  : doc_key                 … 任意（旧形式。文書情報が無い場合のみ使用）
+    文書名    : title                   … 任意（旧形式）
+
+英文・和文のどちらかが空の行（片側のみ）は取り込まない。
+
+使い方（CLI）
+    python ingest.py 対訳表.xlsx
+    python ingest.py 対訳表.xlsx --doc-key AGH_SR26J --title "アサヒ_サスレポ2026_和文" \\
+        --client "アサヒグループホールディングス" --tags "統合報告書,FY2026" --note "..."
+    python ingest.py 対訳表.xlsx --replace        # 同じ文書の既存の対訳を削除してから登録
+    python ingest.py 対訳表.xlsx --defer-index    # 初回の大量投入時（HNSW を投入後に作り直す）
 """
 from __future__ import annotations
 
 import argparse
 import csv
+import io
+import re
 import sys
 import time
 from collections.abc import Iterable, Mapping
-from collections import defaultdict
-from typing import BinaryIO
+from dataclasses import dataclass
+from typing import BinaryIO, Callable
 from zipfile import BadZipFile
 
 from openpyxl import load_workbook
 from openpyxl.utils.exceptions import InvalidFileException
 
-from common import EMBED_DIM, Embedder, clean_text, connect, normalize_for_match
- 
-REQUIRED_COLS = {"doc_key", "source_en", "target_ja"}
-CHUNK_ROWS = 5000  # 1 トランザクションで投入する行数
- 
-def normalize_rows(records: Iterable[Mapping[str, object]]) -> list[dict]:
+from common import EMBED_DIM, LANGS, Embedder, clean_text, connect, normalize_for_match
+from documents import DocInfo, read_doc_info_sheet, upsert_document
+
+TABLE_SHEET = "対訳表"
+CHUNK_ROWS = 5000  # 1 回の COPY で投入する行数
+
+COLUMN_ALIASES: dict[str, tuple[str, ...]] = {
+    "en_text": ("en_text", "英語", "英文", "source_en"),
+    "ja_text": ("ja_text", "日本語", "和文", "target_ja"),
+    "page_en": ("page_en", "ページ(英)"),
+    "page_ja": ("page_ja", "ページ(日)"),
+    "page_no": ("page_no", "ページ"),
+    "doc_key": ("doc_key",),
+    "title": ("title",),
+}
+HNSW_INDEXES = {
+    lang: (f"idx_segments_{lang}_embedding_hnsw",
+           f"CREATE INDEX IF NOT EXISTS idx_segments_{lang}_embedding_hnsw ON segments "
+           f"USING hnsw ({lang}_embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64)")
+    for lang in LANGS
+}
+_PAGE_NUM = re.compile(r"\d+")
+
+Progress = Callable[[float, str], None]
+
+
+@dataclass
+class Bitext:
+    """読み込んだ対訳表（行データと、ファイル内の文書情報）。"""
+    rows: list[dict]
+    doc_info: DocInfo | None
+    skipped: int  # 片側のみ・空行などで取り込まない行数
+
+
+@dataclass
+class IngestResult:
+    inserted: int
+    total: int
+    documents: dict[str, int]  # doc_key → documents.id
+    replaced: int = 0          # --replace で削除した既存の対訳数
+
+
+# ---------------------------------------------------------------------
+# 読み込み
+# ---------------------------------------------------------------------
+def _parse_page(value) -> int | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    m = _PAGE_NUM.search(str(value))
+    return int(m.group()) if m else None
+
+
+def _pick(record: Mapping, key: str):
+    for name in COLUMN_ALIASES[key]:
+        if name in record and record[name] not in (None, ""):
+            return record[name]
+    return None
+
+
+def normalize_rows(records: Iterable[Mapping]) -> tuple[list[dict], int]:
     rows: list[dict] = []
     skipped = 0
-
-    seq_counter: dict[str, int] = defaultdict(int)
-    for line_no, record in enumerate(records, start=2):
-        def cell_text(name: str) -> str:
-            value = record.get(name)
-            return "" if value is None else str(value).strip()
-
-        src = clean_text(cell_text("source_en"))
-        tgt = cell_text("target_ja")
-        doc_key = cell_text("doc_key")
-        if not (src and tgt and doc_key):
+    seq_counter: dict[str | None, int] = {}
+    for record in records:
+        en = clean_text(str(_pick(record, "en_text") or ""))
+        ja = clean_text(str(_pick(record, "ja_text") or ""))
+        if not (en and ja):
             skipped += 1
             continue
-
-        page_value = record.get("page_no")
-        page_raw = cell_text("page_no")
-        try:
-            if isinstance(page_value, float) and page_value.is_integer():
-                page_no = int(page_value)
-            else:
-                page_no = int(page_raw) if page_raw else None
-        except ValueError:
-            print(f"[warn] {line_no}行目: page_no が整数ではないため空にします: {page_raw!r}")
-            page_no = None
-
-        seq_counter[doc_key] += 1
+        page_common = _parse_page(_pick(record, "page_no"))
+        page_en = _parse_page(_pick(record, "page_en"))
+        page_ja = _parse_page(_pick(record, "page_ja"))
+        doc_key = _pick(record, "doc_key")
+        doc_key = str(doc_key).strip() if doc_key is not None else None
+        seq_counter[doc_key] = seq_counter.get(doc_key, 0) + 1
         rows.append({
             "doc_key": doc_key,
-            "title": cell_text("title") or None,
-            "page_no": page_no,
+            "title": _pick(record, "title"),
             "seq_no": seq_counter[doc_key],
-            "source_en": src,
-            "source_norm": normalize_for_match(src),
-            "target_ja": tgt,
+            "page_en": page_en if page_en is not None else page_common,
+            "page_ja": page_ja if page_ja is not None else page_common,
+            "en_text": en, "en_norm": normalize_for_match(en, "en"),
+            "ja_text": ja, "ja_norm": normalize_for_match(ja, "ja"),
         })
-    print(f"読み込み: {len(rows):,} 行（空行などスキップ {skipped:,} 行）")
-    return rows
+    return rows, skipped
 
 
-def read_rows(path: str) -> list[dict]:
-    """CSV ファイルから投入対象の行を読み込む。"""
-    with open(path, newline="", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
-        missing = REQUIRED_COLS - set(reader.fieldnames or [])
-        if missing:
-            sys.exit(f"CSV に必須列がありません: {sorted(missing)}")
-        return normalize_rows(reader)
+def _check_columns(headers: Iterable[str], where: str) -> None:
+    headers = set(headers)
+    missing = [k for k in ("en_text", "ja_text") if not headers & set(COLUMN_ALIASES[k])]
+    if missing:
+        names = " / ".join("・".join(COLUMN_ALIASES[k]) for k in missing)
+        raise ValueError(f"{where}に英文・和文の列が見つかりません（必要な列名: {names}）")
 
 
-def read_excel_rows(source: BinaryIO) -> list[dict]:
-    """Excel ファイルの先頭シートから投入対象の行を読み込む。"""
+def read_excel(source: str | BinaryIO) -> Bitext:
+    """Excel から対訳表と「文書情報」シートを読む。"""
     try:
-        workbook = load_workbook(source, read_only=True, data_only=True)
+        wb = load_workbook(source, read_only=True, data_only=True)
     except (BadZipFile, InvalidFileException, OSError) as exc:
         raise ValueError("有効な .xlsx ファイルを指定してください") from exc
-
     try:
-        worksheet = workbook.worksheets[0]
-        values = worksheet.iter_rows(values_only=True)
-        header_row = next(values, None)
-        headers = [
-            str(value).strip() if value is not None else ""
-            for value in (header_row or ())
-        ]
-        missing = REQUIRED_COLS - set(headers)
-        if missing:
-            raise ValueError(f"Excel の先頭シートに必須列がありません: {sorted(missing)}")
-
-        records = (
-            dict(zip(headers, row))
-            for row in values
-        )
-        return normalize_rows(records)
+        ws = wb[TABLE_SHEET] if TABLE_SHEET in wb.sheetnames else wb.worksheets[0]
+        values = ws.iter_rows(values_only=True)
+        headers = [str(v).strip() if v is not None else "" for v in (next(values, None) or ())]
+        _check_columns(headers, f"「{ws.title}」シート")
+        rows, skipped = normalize_rows(dict(zip(headers, r)) for r in values)
+        return Bitext(rows, read_doc_info_sheet(wb), skipped)
     finally:
-        workbook.close()
+        wb.close()
 
 
-#  文書管理テーブルに新規文書を追加
-def upsert_documents(conn, rows: list[dict]) -> dict[str, int]:
-    docs: dict[str, str | None] = {}
-    for r in rows:
-        docs.setdefault(r["doc_key"], r["title"])
-    with conn.cursor() as cur:
-        cur.executemany(
-            """
-            INSERT INTO documents (doc_key, title) VALUES (%s, %s)
-            ON CONFLICT (doc_key) DO UPDATE
-               SET title = COALESCE(EXCLUDED.title, documents.title)
-            """,
-            list(docs.items()),
-        )
-        cur.execute("SELECT doc_key, id FROM documents WHERE doc_key = ANY(%s)", (list(docs),))
-        mapping = dict(cur.fetchall())
-    conn.commit()
-    print(f"文書: {len(mapping):,} 件")
-    return mapping
- 
- 
-def embed_rows(rows: list[dict], embedder: Embedder, batch_size: int) -> None:
-    """同じ英文（正規化後）は1回だけベクトル化して使い回す。"""
-    unique: dict[str, str] = {}
-    for r in rows:
-        unique.setdefault(r["source_norm"], r["source_en"])
-    keys = list(unique)
-    print(f"ベクトル化: ユニーク英文 {len(keys):,} 件（全 {len(rows):,} 行）")
- 
-    t0 = time.time()
-    vecs = embedder.encode([unique[k] for k in keys], batch_size=batch_size, show_progress=True)
-    if vecs.shape[1] != EMBED_DIM:
-        sys.exit(f"埋め込み次元 {vecs.shape[1]} が EMBED_DIM={EMBED_DIM} と一致しません")
-    lookup = dict(zip(keys, vecs))
-    for r in rows:
-        r["embedding"] = lookup[r["source_norm"]]
-    print(f"ベクトル化完了: {time.time() - t0:.1f} 秒")
- 
- 
-def insert_segments(conn, rows: list[dict], doc_ids: dict[str, int],
-                    model_name: str, allow_duplicates: bool) -> int:
+def read_csv(source: str | BinaryIO) -> Bitext:
+    if isinstance(source, str):
+        f = open(source, newline="", encoding="utf-8-sig")
+    else:
+        f = io.TextIOWrapper(source, encoding="utf-8-sig", newline="")
+    with f:
+        reader = csv.DictReader(f)
+        _check_columns(reader.fieldnames or [], "CSV")
+        rows, skipped = normalize_rows(reader)
+    return Bitext(rows, None, skipped)
+
+
+def read_bitext(path: str) -> Bitext:
+    return read_csv(path) if path.lower().endswith(".csv") else read_excel(path)
+
+
+# ---------------------------------------------------------------------
+# ベクトル化・投入
+# ---------------------------------------------------------------------
+def _embed(rows: list[dict], embedder: Embedder, batch_size: int, report: Progress) -> None:
+    """英文・和文それぞれ、同じ文（正規化後）は1回だけベクトル化して使い回す。"""
+    for k, lang in enumerate(LANGS):
+        unique: dict[str, str] = {}
+        for r in rows:
+            unique.setdefault(r[f"{lang}_norm"], r[f"{lang}_text"])
+        keys = list(unique)
+        report(0.05 + 0.4 * k, f"{'英文' if lang == 'en' else '和文'}をベクトル化中（{len(keys):,} 件）…")
+        vecs = embedder.encode([unique[key] for key in keys], batch_size=batch_size)
+        if vecs.shape[1] != EMBED_DIM:
+            raise ValueError(f"埋め込み次元 {vecs.shape[1]} が EMBED_DIM={EMBED_DIM} と一致しません")
+        lookup = dict(zip(keys, vecs))
+        for r in rows:
+            r[f"{lang}_embedding"] = lookup[r[f"{lang}_norm"]]
+
+
+def _insert_segments(conn, rows: list[dict], doc_ids: dict[str | None, int],
+                     model_name: str, allow_duplicates: bool) -> int:
     dedupe_sql = "" if allow_duplicates else """
         WHERE NOT EXISTS (
             SELECT 1 FROM segments s
              WHERE s.document_id = t.document_id
-               AND s.source_hash = md5(t.source_norm)
-               AND s.target_ja   = t.target_ja
+               AND s.en_hash = md5(t.en_norm)
+               AND s.ja_hash = md5(t.ja_norm)
         )"""
     inserted = 0
     for start in range(0, len(rows), CHUNK_ROWS):
         chunk = rows[start:start + CHUNK_ROWS]
-        with conn.transaction(), conn.cursor() as cur:
-            cur.execute("""
-                CREATE TEMP TABLE tmp_segments (
-                    document_id bigint, page_no integer, seq_no integer,
-                    source_en text, source_norm text, target_ja text,
-                    embedding vector(%s)
-                ) ON COMMIT DROP
-            """ % EMBED_DIM)
-            with cur.copy("COPY tmp_segments FROM STDIN WITH (FORMAT BINARY)") as cp:
-                cp.set_types(["int8", "int4", "int4", "text", "text", "text", "vector"])
-                for r in chunk:
-                    cp.write_row([doc_ids[r["doc_key"]], r["page_no"], r["seq_no"],
-                                  r["source_en"], r["source_norm"], r["target_ja"],
-                                  r["embedding"]])
-            # 同じ CSV 内での重複も除外する（DISTINCT ON）
+        with conn.cursor() as cur:
             cur.execute(f"""
-                INSERT INTO segments (document_id, page_no, seq_no, source_en, source_norm,
-                                      target_ja, embedding, embed_model)
-                SELECT document_id, page_no, seq_no, source_en, source_norm,
-                       target_ja, embedding, %s
-                  FROM (SELECT DISTINCT ON (document_id, source_norm, target_ja) *
+                CREATE TEMP TABLE IF NOT EXISTS tmp_segments (
+                    document_id bigint, seq_no integer, page_ja integer, page_en integer,
+                    en_text text, en_norm text, en_embedding vector({EMBED_DIM}),
+                    ja_text text, ja_norm text, ja_embedding vector({EMBED_DIM})
+                ) ON COMMIT DROP
+            """)
+            cur.execute("TRUNCATE tmp_segments")
+            with cur.copy("COPY tmp_segments FROM STDIN WITH (FORMAT BINARY)") as cp:
+                cp.set_types(["int8", "int4", "int4", "int4",
+                              "text", "text", "vector", "text", "text", "vector"])
+                for r in chunk:
+                    cp.write_row([doc_ids[r["doc_key"]], r["seq_no"], r["page_ja"], r["page_en"],
+                                  r["en_text"], r["en_norm"], r["en_embedding"],
+                                  r["ja_text"], r["ja_norm"], r["ja_embedding"]])
+            # 同じファイル内の重複（同じ英文・同じ和文）も1件にまとめる
+            cur.execute(f"""
+                INSERT INTO segments (document_id, seq_no, page_ja, page_en,
+                                      en_text, en_norm, en_embedding,
+                                      ja_text, ja_norm, ja_embedding, embed_model)
+                SELECT document_id, seq_no, page_ja, page_en,
+                       en_text, en_norm, en_embedding,
+                       ja_text, ja_norm, ja_embedding, %s
+                  FROM (SELECT DISTINCT ON (document_id, en_norm, ja_norm) *
                           FROM tmp_segments
-                         ORDER BY document_id, source_norm, target_ja, seq_no) t
+                         ORDER BY document_id, en_norm, ja_norm, seq_no) t
                 {dedupe_sql}
             """, (model_name,))
             inserted += cur.rowcount
-        print(f"  投入 {min(start + CHUNK_ROWS, len(rows)):,}/{len(rows):,} 行（新規 {inserted:,}）")
     return inserted
- 
- 
-def ingest_rows(
-    rows: list[dict],
+
+
+def ingest_bitext(
+    bitext: Bitext,
+    doc_info: DocInfo | None = None,
+    *,
+    embedder: Embedder | None = None,
+    replace: bool = False,
     batch_size: int = 64,
     defer_index: bool = False,
     allow_duplicates: bool = False,
-) -> int:
+    progress: Progress | None = None,
+    dsn: str | None = None,
+) -> IngestResult:
+    """対訳表を登録する。
+
+    doc_info : 文書情報。指定が無ければファイル内の「文書情報」シートを使う。
+               どちらも無ければ、行ごとの doc_key 列（旧形式）で文書を分ける。
+    replace  : True なら、対象文書の既存の対訳を削除してから登録する（文書情報は残す）。
+    """
+    report = progress or (lambda *_: None)
+    rows = bitext.rows
     if not rows:
-        raise ValueError("投入対象がありません")
+        raise ValueError("取り込める対訳がありません（英文・和文の両方が入った行が必要です）")
 
-    embedder = Embedder()
-    embed_rows(rows, embedder, batch_size)
+    info = (bitext.doc_info or DocInfo()).merged(doc_info).cleaned() if (bitext.doc_info or doc_info) else None
+    if info and info.doc_key:
+        for r in rows:  # 1ファイル = 1文書
+            r["doc_key"] = info.doc_key
+        for i, r in enumerate(rows, start=1):
+            r["seq_no"] = i
+    elif any(r["doc_key"] is None for r in rows):
+        raise ValueError("ファイル名（doc_key）が指定されていません。登録画面または「文書情報」シートで指定してください。")
 
-    with connect() as conn:
-        doc_ids = upsert_documents(conn, rows)
+    embedder = embedder or Embedder()
+    _embed(rows, embedder, batch_size, report)
 
-        if defer_index:
-            conn.execute("DROP INDEX IF EXISTS idx_segments_embedding_hnsw")
-            conn.commit()
+    report(0.85, "データベースに登録中…")
+    with connect(dsn) if dsn else connect() as conn:
+        with conn.transaction():
+            doc_ids: dict[str | None, int] = {}
+            if info and info.doc_key:
+                doc_ids[info.doc_key] = upsert_document(conn, info)
+            else:  # 旧形式：行ごとの doc_key / title
+                for r in rows:
+                    if r["doc_key"] not in doc_ids:
+                        doc_ids[r["doc_key"]] = upsert_document(
+                            conn, DocInfo(doc_key=r["doc_key"], title=r["title"]))
 
-        t0 = time.time()
-        n = insert_segments(conn, rows, doc_ids, embedder.model_name, allow_duplicates)
-        print(f"segments 投入完了: 新規 {n:,} 行 / {time.time() - t0:.1f} 秒")
+            replaced = 0
+            if replace:
+                cur = conn.execute("DELETE FROM segments WHERE document_id = ANY(%s)",
+                                   (list(doc_ids.values()),))
+                replaced = cur.rowcount
 
-        if defer_index:
-            print("HNSW インデックスを作成中…")
-            t0 = time.time()
-            conn.execute("SET maintenance_work_mem = '1GB'")  # NAS のメモリに合わせて調整
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_segments_embedding_hnsw
-                    ON segments USING hnsw (embedding vector_cosine_ops)
-                    WITH (m = 16, ef_construction = 64)
-            """)
-            conn.commit()
-            print(f"インデックス作成完了: {time.time() - t0:.1f} 秒")
- 
+            if defer_index:
+                for name, _ in HNSW_INDEXES.values():
+                    conn.execute(f"DROP INDEX IF EXISTS {name}")
+
+            inserted = _insert_segments(conn, rows, doc_ids, embedder.model_name, allow_duplicates)
+
+            if defer_index:
+                report(0.92, "ベクトル索引を作成中…")
+                conn.execute("SET LOCAL maintenance_work_mem = '1GB'")  # NAS のメモリに合わせて調整
+                for _, ddl in HNSW_INDEXES.values():
+                    conn.execute(ddl)
         conn.execute("ANALYZE documents")
         conn.execute("ANALYZE segments")
         conn.commit()
-    return n
+
+    report(1.0, "完了")
+    return IngestResult(inserted, len(rows), {k: v for k, v in doc_ids.items() if k}, replaced)
 
 
+# ---------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------
 def main() -> None:
-    ap = argparse.ArgumentParser(description="過去翻訳データ一括投入")
-    ap.add_argument("csv_path")
+    ap = argparse.ArgumentParser(description="対訳表の一括投入（英文・和文を同時にベクトル化）")
+    ap.add_argument("path", help="対訳表（.xlsx / .csv）")
+    ap.add_argument("--doc-key", help="ファイル名（文書を一意に識別するキー）")
+    ap.add_argument("--title", help="案件名")
+    ap.add_argument("--client", help="顧客名")
+    ap.add_argument("--tags", help="タグ（カンマ区切り）")
+    ap.add_argument("--note", help="メモ")
+    ap.add_argument("--replace", action="store_true", help="同じ文書の既存の対訳を削除してから登録")
     ap.add_argument("--batch-size", type=int, default=64, help="ベクトル化のバッチサイズ")
     ap.add_argument("--defer-index", action="store_true",
-                    help="HNSW インデックスを一旦削除し、投入後に作り直す（大量投入時に高速）")
+                    help="ベクトル索引を一旦削除し、投入後に作り直す（大量投入時に高速）")
     ap.add_argument("--allow-duplicates", action="store_true",
-                    help="同一文書内の同一英文・同一訳の重複登録を許可する")
+                    help="同一文書内の同じ英文・和文の組も重複登録する")
     args = ap.parse_args()
 
-    rows = read_rows(args.csv_path)
-    if not rows:
-        sys.exit("投入対象がありません")
-    ingest_rows(rows, args.batch_size, args.defer_index, args.allow_duplicates)
- 
- 
+    try:
+        bitext = read_bitext(args.path)
+    except ValueError as exc:
+        sys.exit(str(exc))
+    print(f"読み込み: {len(bitext.rows):,} 行（片側のみ・空行などスキップ {bitext.skipped:,} 行）")
+
+    override = DocInfo(args.doc_key, args.title, args.client, args.tags or [], args.note)
+    t0 = time.time()
+    try:
+        result = ingest_bitext(
+            bitext, override, replace=args.replace, batch_size=args.batch_size,
+            defer_index=args.defer_index, allow_duplicates=args.allow_duplicates,
+            progress=lambda frac, msg: print(f"[{frac:4.0%}] {msg}"),
+        )
+    except ValueError as exc:
+        sys.exit(str(exc))
+    if result.replaced:
+        print(f"既存の対訳を削除: {result.replaced:,} 行")
+    print(f"登録: 新規 {result.inserted:,} 行 / 対象 {result.total:,} 行"
+          f"（文書: {', '.join(result.documents)}）/ {time.time() - t0:.1f} 秒")
+
+
 if __name__ == "__main__":
     main()
- 

@@ -8,11 +8,6 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
-    "openpyxl>=3.1.5",
-    "pgvector>=0.5.1",
-    "psycopg[binary]>=3.3.6",
-    "sentence-transformers>=6.2.0",
-    "streamlit>=1.66.1",
     "torchvision>=0.29.1",
 ]
 
