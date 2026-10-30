@@ -176,16 +176,37 @@ def list_tags(conn) -> list[str]:
         "SELECT DISTINCT unnest(tags) AS tag FROM documents ORDER BY tag")]
 
 
-def find_document_ids(conn, *, clients: list[str] | None = None,
-                      tags: list[str] | None = None, tag_mode: str = "all") -> list[int]:
-    """顧客名（いずれか）とタグで文書を絞り込み、id のリストを返す。
+def list_titles(conn) -> list[str]:
+    return [r[0] for r in conn.execute(
+        "SELECT DISTINCT title FROM documents WHERE title IS NOT NULL ORDER BY title")]
 
+
+def _like_escape(text: str) -> str:
+    """LIKE の特殊文字（\\ % _）を文字として扱うようにエスケープする。"""
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def find_document_ids(conn, *, clients: list[str] | None = None,
+                      titles: list[str] | None = None, title_keyword: str | None = None,
+                      tags: list[str] | None = None, tag_mode: str = "all") -> list[int]:
+    """顧客名・案件名・タグで文書を絞り込み、id のリストを返す（条件どうしは AND）。
+
+    clients       : 顧客名（いずれかに一致）
+    titles        : 案件名（いずれかに完全一致）
+    title_keyword : 案件名に含まれる語（部分一致・大文字小文字と全角半角は区別しない）
     tag_mode="all": 指定タグをすべて持つ文書 / "any": いずれかを持つ文書
     """
     where, params = [], []
     if clients:
         where.append("client = ANY(%s)")
         params.append(list(clients))
+    if titles:
+        where.append("title = ANY(%s)")
+        params.append(list(titles))
+    keyword = clean_field(title_keyword)
+    if keyword:
+        where.append("title ILIKE %s")
+        params.append(f"%{_like_escape(keyword)}%")
     if tags:
         where.append("tags @> %s" if tag_mode == "all" else "tags && %s")
         params.append(parse_tags(tags))

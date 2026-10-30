@@ -11,7 +11,7 @@ import streamlit as st
 from common import LANG_LABEL, Embedder, connect, detect_lang
 from documents import (
     DocInfo, delete_document, find_document_ids, get_document, list_clients, list_documents,
-    list_tags, update_document,
+    list_tags, list_titles, update_document,
 )
 from ingest import Bitext, ingest_bitext, read_csv, read_excel
 from search import hybrid_search
@@ -105,19 +105,23 @@ with search_tab:
     top_k = c2.slider("表示件数", 1, 20, 5)
     min_rate = c3.slider("最低一致率（%）", 0, 100, 0)
 
-    with st.expander("検索対象の絞り込み（顧客名・タグ）"):
+    with st.expander("検索対象の絞り込み（顧客名・案件名・タグ）"):
         try:
             with connect() as conn:
-                all_clients, all_tags = list_clients(conn), list_tags(conn)
+                all_clients, all_titles, all_tags = list_clients(conn), list_titles(conn), list_tags(conn)
         except Exception as exc:
-            all_clients, all_tags = [], []
+            all_clients, all_titles, all_tags = [], [], []
             st.error(f"データベースに接続できません: {exc}")
         f1, f2 = st.columns(2)
         sel_clients = f1.multiselect("顧客名（いずれか）", all_clients, key="filter_clients")
+        sel_titles = f2.multiselect("案件名（いずれか）", all_titles, key="filter_titles")
+        title_keyword = f1.text_input("案件名に含む語（部分一致）", key="filter_title_keyword",
+                                      placeholder="例）サスレポ")
         sel_tags = f2.multiselect("タグ", all_tags, key="filter_tags")
         tag_mode = f2.radio("タグの条件", ["すべて含む", "いずれかを含む"], horizontal=True,
                             key="filter_tag_mode")
-        st.caption("未指定なら全文書が対象です。絞り込み時は対象文書の全行と比較するため、取りこぼしはありません。")
+        st.caption("未指定なら全文書が対象です。複数の条件を指定した場合は、すべての条件を満たす文書が対象です。"
+                   "絞り込み時は対象文書の全行と比較するため、取りこぼしはありません。")
 
     if st.button("検索", type="primary"):
         if not query.strip():
@@ -128,9 +132,10 @@ with search_tab:
                 with st.spinner("検索しています..."):
                     with connect() as conn:
                         doc_ids = None
-                        if sel_clients or sel_tags:
+                        if sel_clients or sel_titles or title_keyword.strip() or sel_tags:
                             doc_ids = find_document_ids(
-                                conn, clients=sel_clients, tags=sel_tags,
+                                conn, clients=sel_clients, titles=sel_titles,
+                                title_keyword=title_keyword, tags=sel_tags,
                                 tag_mode="all" if tag_mode == "すべて含む" else "any")
                         hits = hybrid_search(conn, get_embedder(), query, lang=lang,
                                              doc_ids=doc_ids, top_k=top_k)
