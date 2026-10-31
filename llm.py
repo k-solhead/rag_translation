@@ -6,8 +6,8 @@
     provider   style            説明
     lmstudio   rag              チャット形式。RAG（前年訳・差分・用語集）を使うプロンプト
     lmstudio   plain            チャット形式。従来の translate と同じ短いプロンプト（ファインチューニング済みモデル用）
-    lmstudio   plamo            plamo-2-translate 専用（テキスト補完 API。"English: …\\nJapanese:"）
-    lmstudio   translategemma   translategemma 専用（テキスト補完 API。専用の指示文）
+    lmstudio   plamo            plamo-2-translate 専用（テキスト補完 API。<|plamo:op|> 形式で前年の対訳を few-shot として渡す）
+    lmstudio   translategemma   translategemma 専用（テキスト補完 API。修正モードは前年訳のポストエディットを指示する）
     anthropic  rag              Claude API。RAG を使うプロンプト
 
 LM Studio のモデルは、モデル名から style を自動判定する（detect_style）。

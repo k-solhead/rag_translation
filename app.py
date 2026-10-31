@@ -258,8 +258,9 @@ with translate_tab:
     e1, e2 = st.columns([5, 1])
     sel_labels = e1.multiselect(
         "翻訳に使う LLM（複数可・並列で実行）", list(by_label), key="tr_engines",
-        help="「RAG」は前年訳・差分・用語集を使うプロンプトです。「従来プロンプト」「PLaMo翻訳」"
-             "「TranslateGemma」はモデル専用の短いプロンプトで、用語集は従来プロンプトのみ使います。",
+        help="「RAG」は前年訳・差分・用語集を使うプロンプトです。「PLaMo翻訳」「TranslateGemma」は"
+             "モデル専用の形式で前年訳を使います（用語集は使いません）。「従来プロンプト」は前年訳を使わず、"
+             "必須の用語だけを使います。",
     )
     if e2.button("一覧を更新", key="tr_refresh"):
         get_engines.clear()

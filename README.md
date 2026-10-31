@@ -61,10 +61,10 @@ RAG で抽出した前年の原文・差分・訳文を LLM に渡し、前年�
 |---|---|---|
 | RAG | LM Studio の一般的なモデル（gemma など）、Claude | 前年訳・差分・用語集を使うプロンプト（`translation.py` の `SYSTEM_PROMPT`） |
 | 従来プロンプト | `fine_tuned_*` | translate と同じ短いプロンプト（用語集はシステムプロンプトに追加）。RAG プロンプトでも選べます |
-| PLaMo翻訳 | `plamo-2-translate` | テキスト補完 API で `English: …\nJapanese:`（改行で停止） |
-| TranslateGemma | `translategemma-*` | テキスト補完 API で専用の指示文 |
+| PLaMo翻訳 | `plamo-2-translate` | テキスト補完 API で `<\|plamo:op\|>` 形式。修正は前年の対訳を3回、参考は類似の対訳を few-shot として渡す |
+| TranslateGemma | `translategemma-*` | テキスト補完 API で Gemma のターン形式。修正は前年訳のポストエディットを指示し、参考は類似の対訳を few-shot として渡す |
 
-PLaMo翻訳・TranslateGemma・従来プロンプトは前年訳・差分を使いません（前年訳流用の判定は共通です）。比較用として並べて使うことを想定しています。
+PLaMo翻訳・TranslateGemma は差分の一覧を渡さず、前年の原文と今年の原文を並べて反映させます。用語集は使いません。従来プロンプトは前年訳・差分を使いません（前年訳流用の判定は共通です）。
 
 ### 設定（`.env`）
 | 変数 | 内容 |

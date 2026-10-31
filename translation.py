@@ -169,6 +169,9 @@ _INSTRUCTION = {
     "ja": "Translate <source> into English. Output only the translation.",
 }
 
+PLAMO_OP = "<|plamo:op|>"
+PLAMO_EDIT_REPEAT = 3  # 修正モードで前年の対訳を並べる回数
+
 
 def format_changes(diff_ops: list[dict], lang: Lang) -> str:
     """search.py の diff_ops（前年の原文 → 今年の原文）を、LLM 向けの変更点の箇条書きにする。"""
@@ -233,33 +236,76 @@ def build_plain_prompt(text: str, lang: Lang, terms: list[Term]) -> tuple[str, s
     return system, f"Translate the following {src} text to {tgt}: '{text}'"
 
 
-def build_plamo_prompt(text: str, lang: Lang) -> str:
-    """plamo-2-translate 用（translate.py と同じ形式）。"""
+def _one_line(text: str) -> str:
+    return re.sub(r"\s*\n\s*", " ", text)
+
+
+def build_plamo_prompt(text: str, lang: Lang, mode: str, hits: list[dict]) -> str:
+    """plamo-2-translate 用。
+
+    指示文を書けないモデルなので、過去の対訳を few-shot として並べて踏襲させる。
+    修正モードは前年の対訳を繰り返すと踏襲が強まる（1回より3回のほうが前年訳に近い）。
+    """
     src, tgt = ("English", "Japanese") if lang == "en" else ("Japanese", "English")
-    return f"{src}: {text}\n{tgt}:"
+    shots = []
+    if mode == "edit":
+        shots = hits[:1] * PLAMO_EDIT_REPEAT
+    elif mode == "reference":
+        shots = hits[::-1]  # 最も似た文を今年の文の直前に置く
+    examples = "".join(
+        f"{PLAMO_OP}input lang={src}\n{_one_line(h['source_text'])}\n"
+        f"{PLAMO_OP}output lang={tgt}\n{_one_line(h['target_text'])}\n"
+        for h in shots)
+    return (f"{PLAMO_OP}dataset\ntranslation\n{examples}"
+            f"{PLAMO_OP}input lang={src}\n{_one_line(text)}\n{PLAMO_OP}output lang={tgt}\n")
 
 
-def build_translategemma_prompt(text: str, lang: Lang) -> str:
-    """translategemma 用（translate.py と同じ指示文）。"""
+def _gemma_turn(user: str, model: str | None = None) -> str:
+    turn = f"<start_of_turn>user\n{user}<end_of_turn>\n<start_of_turn>model\n"
+    return turn if model is None else f"{turn}{model}<end_of_turn>\n"
+
+
+def build_translategemma_prompt(text: str, lang: Lang, mode: str, hits: list[dict]) -> str:
+    """translategemma 用。
+
+    修正モードはポストエディットの指示文にする（公式には非サポートだが前年訳を最もよく踏襲する）。
+    変更点の一覧は渡さなくても結果が変わらないので、前年と今年の原文だけを渡す。
+    """
     (src, sc), (tgt, tc) = ((("English", "en"), ("Japanese", "ja")) if lang == "en"
                             else (("Japanese", "ja"), ("English", "en")))
-    return (
+    if mode == "edit" and hits:
+        top = hits[0]
+        return _gemma_turn(
+            f"You are a professional {src} ({sc}) to {tgt} ({tc}) translator and post-editor. "
+            f"Update the previous {tgt} translation so that it matches the new {src} text. "
+            f"Change only what differs and keep all other wording exactly as it is. "
+            f"Produce only the updated {tgt} translation, without any additional explanations or commentary.\n\n"
+            f"Previous {src} text:\n{top['source_text']}\n\n"
+            f"Previous {tgt} translation:\n{top['target_text']}\n\n"
+            f"New {src} text:\n{text}"
+        )
+    intro = (
         f"You are a professional {src} ({sc}) to {tgt} ({tc}) translator. "
         f"Your goal is to accurately convey the meaning and nuances of the original {src} text "
         f"while adhering to {tgt} grammar, vocabulary, and cultural sensitivities. "
         f"Produce only the {tgt} translation, without any additional explanations or commentary. "
-        f"Please translate the following {src} text into {tgt}:\n\n{text}\n"
+        f"Please translate the following {src} text into {tgt}:\n\n\n"
     )
+    examples = ""
+    if mode == "reference":
+        # 最も似た文を今年の文の直前に置く
+        examples = "".join(_gemma_turn(intro + h["source_text"], h["target_text"]) for h in hits[::-1])
+    return examples + _gemma_turn(intro + text)
 
 
 def run_engine(engine: Engine, text: str, lang: Lang, mode: str, hits: list[dict],
                terms: list[Term]) -> str:
     """1文を1つのエンジンで翻訳する。"""
-    one_line = re.sub(r"\s*\n\s*", " ", text)
     if engine.style == "plamo":
-        return complete(engine, build_plamo_prompt(one_line, lang), stop=["\n"])
+        return complete(engine, build_plamo_prompt(text, lang, mode, hits), stop=[PLAMO_OP])
     if engine.style == "translategemma":
-        return complete(engine, build_translategemma_prompt(text, lang))
+        return complete(engine, build_translategemma_prompt(text, lang, mode, hits),
+                        stop=["<end_of_turn>"])
     if engine.style == "plain":
         return chat(engine, *build_plain_prompt(text, lang, terms))
     return chat(engine, *build_rag_prompt(text, lang, mode, hits, terms))
