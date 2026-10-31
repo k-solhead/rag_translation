@@ -40,6 +40,12 @@ services:
         condition: service_healthy
     environment:
       TM_DATABASE_URL: postgresql://tm:${POSTGRES_PASSWORD}@db:5432/tm
+      # 翻訳機能（.env で設定）
+      LMSTUDIO_BASE_URL: ${LMSTUDIO_BASE_URL:-http://192.168.11.83:1234/v1}
+      LMSTUDIO_CONCURRENCY: ${LMSTUDIO_CONCURRENCY:-1}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      CLAUDE_MODELS: ${CLAUDE_MODELS:-claude-haiku-5-5,claude-sonnet-5-5}
+      CLAUDE_CONCURRENCY: ${CLAUDE_CONCURRENCY:-4}
     ports:
       - "${APP_PORT:-8501}:8501"
 
