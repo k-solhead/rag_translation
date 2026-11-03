@@ -1,4 +1,4 @@
-"""LLM への接続を共通化する（LM Studio のローカル LLM と Claude API）。
+"""LLM への接続を共通化する（LM Studio / Ollama のローカル LLM と Claude API）。
 
 翻訳エンジン（Engine）は「どこに接続するか（provider）」と
 「どの形式でプロンプトを渡すか（style）」の組み合わせで表す。
@@ -8,13 +8,17 @@
     lmstudio   plain            チャット形式。従来の translate と同じ短いプロンプト（ファインチューニング済みモデル用）
     lmstudio   plamo            plamo-2-translate 専用（テキスト補完 API。<|plamo:op|> 形式で前年の対訳を few-shot として渡す）
     lmstudio   translategemma   translategemma 専用（テキスト補完 API。修正モードは前年訳のポストエディットを指示する）
+    ollama     (同上)           LM Studio と同じ 4 種類。Ollama のネイティブ API（/api/chat・/api/generate）で呼ぶ
     anthropic  rag              Claude API。RAG を使うプロンプト
 
-LM Studio のモデルは、モデル名から style を自動判定する（detect_style）。
+LM Studio / Ollama のモデルは、モデル名から style を自動判定する（detect_style）。
 
 環境変数
     LMSTUDIO_BASE_URL     LM Studio の接続先（既定: http://192.168.11.83:1234/v1）
     LMSTUDIO_CONCURRENCY  LM Studio への同時リクエスト数（既定: 1）
+    OLLAMA_BASE_URL       Ollama の接続先（既定: http://192.168.11.83:11434。空にすると Ollama は使わない）
+    OLLAMA_CONCURRENCY    Ollama への同時リクエスト数（既定: 1）
+    OLLAMA_NUM_CTX        Ollama のコンテキスト長（既定: 8192。Ollama 既定のままだと RAG プロンプトが切り詰められる）
     ANTHROPIC_API_KEY     Claude API のキー（未設定なら Claude は選択肢に出ない）
     CLAUDE_MODELS         選択肢に出す Claude のモデル（カンマ区切り。既定: claude-haiku-5-5,claude-sonnet-5-5）
     CLAUDE_CONCURRENCY    Claude API への同時リクエスト数（既定: 4）
@@ -30,6 +34,9 @@ import requests
 
 LMSTUDIO_BASE_URL = os.getenv("LMSTUDIO_BASE_URL", "http://192.168.11.83:1234/v1").rstrip("/")
 LMSTUDIO_CONCURRENCY = int(os.getenv("LMSTUDIO_CONCURRENCY", "1"))
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://192.168.11.83:11434").rstrip("/")
+OLLAMA_CONCURRENCY = int(os.getenv("OLLAMA_CONCURRENCY", "1"))
+OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "8192"))
 CLAUDE_MODELS = [m.strip() for m in os.getenv(
     "CLAUDE_MODELS", "claude-haiku-5-5,claude-sonnet-5-5").split(",") if m.strip()]
 CLAUDE_CONCURRENCY = int(os.getenv("CLAUDE_CONCURRENCY", "4"))
@@ -41,11 +48,12 @@ STYLE_LABEL = {
     "plamo": "PLaMo翻訳",
     "translategemma": "TranslateGemma",
 }
+PROVIDER_LABEL = {"lmstudio": "LM Studio", "ollama": "Ollama", "anthropic": "Claude"}
 
 
 @dataclass(frozen=True)
 class Engine:
-    provider: str   # "lmstudio" / "anthropic"
+    provider: str   # "lmstudio" / "ollama" / "anthropic"
     model: str
     style: str      # "rag" / "plain" / "plamo" / "translategemma"
 
@@ -55,8 +63,7 @@ class Engine:
 
     @property
     def label(self) -> str:
-        where = "Claude" if self.provider == "anthropic" else "LM Studio"
-        return f"{self.model}（{where}・{STYLE_LABEL[self.style]}）"
+        return f"{self.model}（{PROVIDER_LABEL[self.provider]}・{STYLE_LABEL[self.style]}）"
 
     @property
     def uses_rag(self) -> bool:
@@ -64,11 +71,12 @@ class Engine:
 
     @property
     def concurrency(self) -> int:
-        return CLAUDE_CONCURRENCY if self.provider == "anthropic" else LMSTUDIO_CONCURRENCY
+        return {"anthropic": CLAUDE_CONCURRENCY, "ollama": OLLAMA_CONCURRENCY}.get(
+            self.provider, LMSTUDIO_CONCURRENCY)
 
 
 def detect_style(model: str) -> str:
-    """LM Studio のモデル名からプロンプト形式を判定する。"""
+    """LM Studio / Ollama のモデル名からプロンプト形式を判定する。"""
     name = model.lower()
     if "plamo" in name and "translate" in name:
         return "plamo"
@@ -93,6 +101,28 @@ def fetch_lmstudio_models() -> list[str] | None:
         return None
 
 
+def fetch_ollama_models() -> list[str] | None:
+    """Ollama からインストール済みモデル一覧を取得する。接続できなければ None。"""
+    try:
+        r = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=5)
+        r.raise_for_status()
+        return [m["name"] for m in r.json().get("models", [])
+                if "embed" not in m["name"].lower()  # 埋め込みモデルは除外
+                and not m.get("remote_host")]        # クラウドモデル（:cloud）は原稿が外部に送られるので除外
+    except Exception:
+        return None
+
+
+def _local_engines(provider: str, models: list[str]) -> list[Engine]:
+    engines: list[Engine] = []
+    for m in models:
+        style = detect_style(m)
+        engines.append(Engine(provider, m, style))
+        if style == "plain":  # ファインチューニング済みモデルは RAG プロンプトでも試せるようにする
+            engines.append(Engine(provider, m, "rag"))
+    return engines
+
+
 def claude_available() -> bool:
     return bool(os.getenv("ANTHROPIC_API_KEY"))
 
@@ -105,11 +135,13 @@ def available_engines() -> tuple[list[Engine], list[str]]:
     if models is None:
         warnings.append(f"LM Studio（{LMSTUDIO_BASE_URL}）に接続できません。ローカル LLM は使えません。")
     else:
-        for m in models:
-            style = detect_style(m)
-            engines.append(Engine("lmstudio", m, style))
-            if style == "plain":  # ファインチューニング済みモデルは RAG プロンプトでも試せるようにする
-                engines.append(Engine("lmstudio", m, "rag"))
+        engines += _local_engines("lmstudio", models)
+    if OLLAMA_BASE_URL:
+        models = fetch_ollama_models()
+        if models is None:
+            warnings.append(f"Ollama（{OLLAMA_BASE_URL}）に接続できません。Ollama のモデルは使えません。")
+        else:
+            engines += _local_engines("ollama", models)
     if claude_available():
         engines += [Engine("anthropic", m, "rag") for m in CLAUDE_MODELS]
     else:
@@ -149,9 +181,17 @@ def clean_output(text: str) -> str:
     return text
 
 
+def _ollama(path: str, payload: dict) -> dict:
+    r = requests.post(f"{OLLAMA_BASE_URL}{path}", json={**payload, "stream": False},
+                      timeout=REQUEST_TIMEOUT)
+    if not r.ok:  # Ollama はエラー理由を本文の "error" に入れて返す
+        raise RuntimeError(f"Ollama {r.status_code}: {r.text[:300]}")
+    return r.json()
+
+
 def chat(engine: Engine, system: str, user: str, *, temperature: float = 0.1,
          max_tokens: int = 2048) -> str:
-    """チャット形式で1回呼び出す（LM Studio / Claude）。"""
+    """チャット形式で1回呼び出す（LM Studio / Ollama / Claude）。"""
     if engine.provider == "anthropic":
         kwargs = {}
         if os.getenv("CLAUDE_TEMPERATURE"):
@@ -166,6 +206,15 @@ def chat(engine: Engine, system: str, user: str, *, temperature: float = 0.1,
         )
         return clean_output("".join(b.text for b in msg.content if b.type == "text"))
 
+    if engine.provider == "ollama":
+        res = _ollama("/api/chat", {
+            "model": engine.model,
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            "think": False,  # 思考モデル（qwen3 など）の推論を止める（翻訳品質はほぼ同じで大幅に速い）
+            "options": {"temperature": temperature, "num_predict": max_tokens, "num_ctx": OLLAMA_NUM_CTX},
+        })
+        return clean_output(res["message"]["content"])
+
     res = _openai_client().chat.completions.create(
         model=engine.model,
         messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
@@ -177,7 +226,16 @@ def chat(engine: Engine, system: str, user: str, *, temperature: float = 0.1,
 
 def complete(engine: Engine, prompt: str, *, stop: list[str] | None = None,
              max_tokens: int = 2048) -> str:
-    """テキスト補完形式で1回呼び出す（plamo-2-translate / translategemma 用。LM Studio のみ）。"""
+    """テキスト補完形式で1回呼び出す（plamo-2-translate / translategemma 用。LM Studio / Ollama）。"""
+    if engine.provider == "ollama":
+        # raw: モデルのチャットテンプレートを通さず、プロンプトをそのまま渡す
+        res = _ollama("/api/generate", {
+            "model": engine.model, "prompt": prompt, "raw": True,
+            "options": {"temperature": 0, "num_predict": max_tokens, "num_ctx": OLLAMA_NUM_CTX,
+                        **({"stop": stop} if stop else {})},
+        })
+        return clean_output(res["response"])
+
     res = _openai_client().completions.create(
         model=engine.model, prompt=prompt, stop=stop, max_tokens=max_tokens, temperature=0,
     )

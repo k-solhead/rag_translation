@@ -59,7 +59,7 @@ RAG で抽出した前年の原文・差分・訳文を LLM に渡し、前年�
 ### 使える LLM（プロンプトの形式はモデル名から自動判定）
 | 表示 | 対象 | プロンプト |
 |---|---|---|
-| RAG | LM Studio の一般的なモデル（gemma など）、Claude | 前年訳・差分・用語集を使うプロンプト（`translation.py` の `SYSTEM_PROMPT`） |
+| RAG | LM Studio / Ollama の一般的なモデル（gemma など）、Claude | 前年訳・差分・用語集を使うプロンプト（`translation.py` の `SYSTEM_PROMPT`） |
 | 従来プロンプト | `fine_tuned_*` | translate と同じ短いプロンプト（用語集はシステムプロンプトに追加）。RAG プロンプトでも選べます |
 | PLaMo翻訳 | `plamo-2-translate` | テキスト補完 API で `<\|plamo:op\|>` 形式。修正は前年の対訳を3回、参考は類似の対訳を few-shot として渡す |
 | TranslateGemma | `translategemma-*` | テキスト補完 API で Gemma のターン形式。修正は前年訳のポストエディットを指示し、参考は類似の対訳を few-shot として渡す |
@@ -71,6 +71,9 @@ PLaMo翻訳・TranslateGemma は差分の一覧を渡さず、前年の原文と
 |---|---|
 | `LMSTUDIO_BASE_URL` | LM Studio の接続先（既定 `http://192.168.11.83:1234/v1`） |
 | `LMSTUDIO_CONCURRENCY` | LM Studio への同時リクエスト数（既定 1。GPU に余裕があれば増やす） |
+| `OLLAMA_BASE_URL` | Ollama の接続先（既定 `http://192.168.11.83:11434`。空なら Ollama は使いません） |
+| `OLLAMA_CONCURRENCY` | Ollama への同時リクエスト数（既定 1） |
+| `OLLAMA_NUM_CTX` | Ollama のコンテキスト長（既定 8192。Ollama 側の既定のままだと RAG プロンプトが切り詰められます） |
 | `ANTHROPIC_API_KEY` | Claude API のキー。空なら Claude は選択肢に出ません |
 | `CLAUDE_MODELS` | 選択肢に出す Claude のモデル（既定 `claude-haiku-5-5,claude-sonnet-5-5`） |
 | `CLAUDE_CONCURRENCY` | Claude API への同時リクエスト数（既定 4） |
