@@ -24,6 +24,7 @@ from glossary_extract import (
 from ingest import Bitext, ingest_bitext, read_csv, read_excel
 from llm import available_engines
 from search import hybrid_search
+from usage import PROVIDERS, ensure_usage_table, format_time, get_usage, reset_usage
 from translation import (
     MODE_LABEL, TranslationSettings, detect_document_lang, extract_from_docx, extract_from_text,
     extract_from_xlsx, make_units, results_to_excel, run_translation,
@@ -75,9 +76,10 @@ def rate_color(rate: int) -> str:
 
 @st.cache_resource(show_spinner=False)
 def ensure_schema() -> bool:
-    """既存の DB に、後から追加したテーブル（用語集）を作る。"""
+    """既存の DB に、後から追加したテーブル（用語集・トークン数の累計）を作る。"""
     with connect() as conn:
         ensure_glossary_table(conn)
+        ensure_usage_table(conn)
     return True
 
 
@@ -154,8 +156,8 @@ try:
 except Exception as exc:
     st.error(f"データベースに接続できません: {exc}")
 
-search_tab, translate_tab, ingest_tab, glossary_tab, docs_tab = st.tabs(
-    ["過去翻訳を検索", "翻訳", "データ取り込み", "用語集", "文書管理"], key="main_tab")
+search_tab, translate_tab, ingest_tab, glossary_tab, docs_tab, usage_tab = st.tabs(
+    ["過去翻訳を検索", "翻訳", "データ取り込み", "用語集", "文書管理", "トークン数管理"], key="main_tab")
 
 # =====================================================================
 # 検索
@@ -268,6 +270,37 @@ with translate_tab:
 
     with st.expander("過去訳（RAG）の検索対象 ― 前年の文書に絞り込むと精度が上がります"):
         tr_filter = doc_filter_inputs("tr_filter")
+
+    # 絞り込みの結果（条件がなければ全文書）を常に表示する
+    with st.container(border=True):
+        try:
+            with connect() as conn:
+                tr_doc_ids = resolve_doc_ids(conn, tr_filter)
+                all_docs = list_documents(conn)
+        except Exception as exc:
+            tr_doc_ids, all_docs = None, []
+            st.error(f"データベースに接続できません: {exc}")
+        if tr_doc_ids is None:
+            target_docs = all_docs
+        else:
+            id_set = set(tr_doc_ids)
+            target_docs = [d for d in all_docs if d["id"] in id_set]
+        n_pairs = sum(d["segments"] for d in target_docs)
+        if tr_doc_ids is None:
+            st.markdown(f"**過去訳の検索対象：全文書**（{len(target_docs):,} 文書・対訳 {n_pairs:,} 組）")
+        elif not target_docs:
+            st.markdown("**過去訳の検索対象：該当する文書がありません**")
+            st.caption("このまま翻訳すると、過去訳を使わずに翻訳します。絞り込み条件を見直してください。")
+        else:
+            st.markdown(f"**過去訳の検索対象：絞り込み結果 {len(target_docs):,} 文書**（対訳 {n_pairs:,} 組）")
+        if target_docs:
+            st.dataframe(
+                pd.DataFrame([{
+                    "ファイル名": d["doc_key"], "案件名": d["title"] or "", "顧客名": d["client"] or "",
+                    "タグ": "、".join(d["tags"] or []), "対訳数": d["segments"],
+                } for d in target_docs]),
+                hide_index=True, height=min(35 * (len(target_docs) + 1) + 3, 220),
+            )
 
     try:
         with connect() as conn:
@@ -726,3 +759,60 @@ with docs_tab:
                 else:
                     flash(f"「{doc['doc_key']}」を削除しました。")
                     st.rerun()
+
+
+# =====================================================================
+# トークン数管理
+# =====================================================================
+def _reset_provider_usage(provider: str) -> None:
+    """「ゼロに初期化」ボタンの処理（確認のチェックも外す）。"""
+    try:
+        with connect() as conn:
+            reset_usage(conn, provider)
+    except Exception as exc:
+        st.session_state["usage_error"] = f"初期化に失敗しました: {exc}"
+    else:
+        flash(f"{PROVIDERS[provider]} のトークン数をゼロに初期化しました。")
+    st.session_state[f"usage_confirm_{provider}"] = False
+
+
+with usage_tab:
+    st.caption(
+        "Claude・OpenAI・Gemini を呼び出すたびに、応答に含まれるトークン数を加算しています"
+        "（「翻訳」と、用語集の「LLM で文中の用語を抽出」）。データベースに保存しているため、"
+        "再起動しても消えず、アプリを使う全員の使用分が合算されます。"
+    )
+    if st.button("最新の数に更新", key="usage_refresh"):
+        st.rerun()
+    if err := st.session_state.pop("usage_error", None):
+        st.error(err)
+    try:
+        with connect() as conn:
+            usage_rows = get_usage(conn)
+    except Exception as exc:
+        usage_rows = {}
+        st.error(f"データベースに接続できません: {exc}")
+
+    usage_cols = st.columns(len(PROVIDERS))
+    for col, (provider, name) in zip(usage_cols, PROVIDERS.items()):
+        u = usage_rows.get(provider)
+        if u is None:
+            continue
+        with col.container(border=True):
+            st.subheader(name)
+            st.metric("入力トークン（キャッシュ以外）", f"{u['input_tokens']:,}")
+            st.metric("出力トークン", f"{u['output_tokens']:,}")
+            st.metric("キャッシュ入力トークン（読み込み）", f"{u['cache_read_tokens']:,}")
+            st.metric("キャッシュ出力トークン（書き込み）", f"{u['cache_write_tokens']:,}")
+            st.caption(f"呼び出し回数 {u['requests']:,} 回\n\n最終更新 {format_time(u['updated_at'])}"
+                       f"\n\n集計開始 {format_time(u['reset_at'])}")
+            confirm = st.checkbox(f"{name} の累計をゼロに戻す", key=f"usage_confirm_{provider}")
+            st.button("ゼロに初期化", key=f"usage_reset_{provider}", disabled=not confirm,
+                      on_click=_reset_provider_usage, args=(provider,))
+
+    st.caption(
+        "入力トークン × 入力単価 ＋ 出力トークン × 出力単価 ＋ キャッシュ入力 × キャッシュ読み込み単価 ＋ "
+        "キャッシュ出力 × キャッシュ書き込み単価 が、おおよその料金です（単価はモデルごとに各社の料金表を参照）。"
+        "OpenAI の出力トークンには推論に使った分も含まれます。OpenAI・Gemini は、キャッシュへの書き込み数が"
+        "応答に含まれない場合 0 と表示されます。"
+    )

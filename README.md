@@ -59,7 +59,7 @@ RAG で抽出した前年の原文・差分・訳文を LLM に渡し、前年�
 ### 使える LLM（プロンプトの形式はモデル名から自動判定）
 | 表示 | 対象 | プロンプト |
 |---|---|---|
-| RAG | LM Studio / Ollama の一般的なモデル（gemma など）、Claude | 前年訳・差分・用語集を使うプロンプト（`translation.py` の `SYSTEM_PROMPT`） |
+| RAG | LM Studio / Ollama の一般的なモデル（gemma など）、Claude、OpenAI、Gemini | 前年訳・差分・用語集を使うプロンプト（`translation.py` の `SYSTEM_PROMPT`） |
 | 従来プロンプト | `fine_tuned_*` | translate と同じ短いプロンプト（用語集はシステムプロンプトに追加）。RAG プロンプトでも選べます |
 | PLaMo翻訳 | `plamo-2-translate` | テキスト補完 API で `<\|plamo:op\|>` 形式。修正は前年の対訳を3回、参考は類似の対訳を few-shot として渡す |
 | TranslateGemma | `translategemma-*` | テキスト補完 API で Gemma のターン形式。修正は前年訳のポストエディットを指示し、参考は類似の対訳を few-shot として渡す |
@@ -77,6 +77,15 @@ PLaMo翻訳・TranslateGemma は差分の一覧を渡さず、前年の原文と
 | `ANTHROPIC_API_KEY` | Claude API のキー。空なら Claude は選択肢に出ません |
 | `CLAUDE_MODELS` | 選択肢に出す Claude のモデル（既定 `claude-haiku-5-5,claude-sonnet-5-5`） |
 | `CLAUDE_CONCURRENCY` | Claude API への同時リクエスト数（既定 4） |
+| `OPENAI_API_KEY` | OpenAI API のキー。空なら OpenAI は選択肢に出ません |
+| `OPENAI_MODELS` | 選択肢に出す OpenAI のモデル（既定 `gpt-6-luna,gpt-6.1-sol`） |
+| `OPENAI_CONCURRENCY` | OpenAI API への同時リクエスト数（既定 4） |
+| `GEMINI_API_KEY` | Gemini API のキー。空なら Gemini は選択肢に出ません |
+| `GEMINI_MODELS` | 選択肢に出す Gemini のモデル（既定 `gemini-3.8-flash`） |
+| `GEMINI_CONCURRENCY` | Gemini API への同時リクエスト数（既定 4） |
+| `OPENAI_REASONING_EFFORT` / `GEMINI_REASONING_EFFORT` | 任意。推論の深さ（例 `low`）。空なら各社の既定。翻訳では `low` にすると速く安くなります |
+| `OPENAI_TEMPERATURE` / `GEMINI_TEMPERATURE` | 任意。temperature を受け付けないモデルがあるため、空なら送りません |
+| `CLOUD_MAX_TOKENS` | OpenAI / Gemini の出力トークン上限（既定 8192）。推論型モデルは推論にもトークンを使うため多めにしています。「出力が空でした（finish_reason=length）」と出たら増やしてください |
 
 `.env` を変更したら `docker compose up -d` で反映されます（再ビルド不要）。
 
@@ -86,6 +95,28 @@ PLaMo翻訳・TranslateGemma は差分の一覧を渡さず、前年の原文と
 3. 使いすぎ防止のため、Console で翻訳用のワークスペースを作り、月の利用上限を設定しておくと安心です
 
 クレジットを使い切ると API は止まります（プラン料金に上乗せはされません）。システムプロンプトはキャッシュされ、完全一致の文は LLM に送らないため、費用を抑えられます。
+
+### OpenAI・Gemini を API で使う手順
+- **OpenAI**：platform.openai.com で API キーを発行し、`.env` の `OPENAI_API_KEY` に設定します。API の料金は ChatGPT の契約とは別の従量課金です。
+- **Gemini**：Google AI Studio（aistudio.google.com）で API キーを発行し、`.env` の `GEMINI_API_KEY` に設定します。Google 公式の OpenAI 互換エンドポイント（`https://generativelanguage.googleapis.com/v1beta/openai/`）経由で呼び出します。
+  - **無料枠のキーでは、送った内容が Google のサービス改善に使われます。** 顧客の原稿を送るため、課金を有効にした有料枠のキーを使ってください（有料枠では使われません）。
+- モデル名は各社で随時更新されます。使いたいモデルは `OPENAI_MODELS` / `GEMINI_MODELS` で指定してください。
+- OpenAI・Gemini は「翻訳」タブと、用語集タブの「LLM で文中の用語を抽出」の両方で選べます。
+
+## トークン数管理（「トークン数管理」タブ）
+OpenAI・Claude・Gemini を呼び出すたびに、応答の `usage` に含まれるトークン数を加算し、プロバイダーごとの累計を表示します（「翻訳」と、用語集の「LLM で文中の用語を抽出」が対象。LM Studio / Ollama は対象外）。
+
+| 表示 | Claude | OpenAI / Gemini |
+|---|---|---|
+| 入力トークン（キャッシュ以外） | `input_tokens` | `prompt_tokens` − キャッシュ分 |
+| 出力トークン | `output_tokens` | `completion_tokens`（推論分を含む） |
+| キャッシュ入力トークン（読み込み） | `cache_read_input_tokens` | `prompt_tokens_details.cached_tokens` |
+| キャッシュ出力トークン（書き込み） | `cache_creation_input_tokens` | 応答に項目がある場合のみ（無ければ 0） |
+
+- 累計はデータベース（`token_usage` テーブル）に保存するため、再起動しても消えず、アプリを使う全員の使用分が合算されます。テーブルはアプリ起動時に自動で作られます。
+- 各プロバイダーの「ゼロに初期化」で、そのプロバイダーの累計を 0 に戻せます（確認のチェックを入れてから押します）。「集計開始」はゼロに戻した日時です。
+- 4 つの値にそれぞれの単価（入力・出力・キャッシュ読み込み・キャッシュ書き込み）を掛けて足すと、おおよその料金になります。
+- 記録に失敗しても翻訳は止まりません（ログに警告が出ます）。
 
 ## 用語集（「用語集」タブ）
 - 「（共通）」と顧客ごとの用語集を管理します。顧客名は文書の顧客名から選ぶか、新しく入力します。
@@ -118,6 +149,7 @@ PLaMo翻訳・TranslateGemma は差分の一覧を渡さず、前年の原文と
 |---|---|
 | documents（文書） | `doc_key`＝ファイル名（一意）、`title`＝案件名、`client`＝顧客名、`tags`＝タグ（配列）、`note`＝メモ |
 | segments（対訳） | `document_id`、`seq_no`、`page_ja` / `page_en`、`en_text` / `en_norm` / `en_hash` / `en_embedding`、`ja_text` / `ja_norm` / `ja_hash` / `ja_embedding` |
+| token_usage（トークン数の累計） | `provider`、`input_tokens`、`output_tokens`、`cache_read_tokens`、`cache_write_tokens`、`requests`、`updated_at`、`reset_at` |
 | glossary_terms（用語集） | `client`＝顧客名（空＝共通）、`en`、`ja`、`note`、`required`＝必須（true）／参考（false） |
 
 対訳表（Excel）の列は `日本語` / `英語`（idml2xlsx の出力そのまま）のほか、`ja_text` / `en_text`、旧形式の `target_ja` / `source_en` も読み込めます。

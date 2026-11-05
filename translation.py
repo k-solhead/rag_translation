@@ -411,11 +411,14 @@ def translate_rows(rows: list[RowResult], st: TranslationSettings, progress: Pro
     done = 0
     if total == 0:
         progress(1.0, "翻訳対象はありません（すべて前年訳を流用）")
-    pools = {e.key: ThreadPoolExecutor(max_workers=max(1, e.concurrency)) for e in st.engines}
+    pools = {
+        provider: ThreadPoolExecutor(max_workers=max(1, engine.concurrency))
+        for provider, engine in {e.provider: e for e in st.engines}.items()
+    }
     try:
         futures = {
-            pools[e.key].submit(run_engine, e, r.unit.text, st.lang,
-                                "edit" if r.mode == "exact" else r.mode, r.hits, r.terms): (r, e)
+            pools[e.provider].submit(run_engine, e, r.unit.text, st.lang,
+                                     "edit" if r.mode == "exact" else r.mode, r.hits, r.terms): (r, e)
             for r, e in jobs
         }
         for fut in as_completed(futures):

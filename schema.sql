@@ -115,3 +115,18 @@ DROP TRIGGER IF EXISTS trg_glossary_terms_updated_at ON glossary_terms;
 CREATE TRIGGER trg_glossary_terms_updated_at
     BEFORE UPDATE ON glossary_terms
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- ---------------------------------------------------------------------
+-- クラウド LLM のトークン使用量の累計（プロバイダーごと。全員分を合算）
+--   ※既存の DB には、アプリ起動時に自動で作成される（usage.py の ensure_usage_table）
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS token_usage (
+    provider            text         PRIMARY KEY,           -- anthropic / openai / gemini
+    input_tokens        bigint       NOT NULL DEFAULT 0,    -- 入力（キャッシュ以外）
+    output_tokens       bigint       NOT NULL DEFAULT 0,    -- 出力（推論分を含む）
+    cache_read_tokens   bigint       NOT NULL DEFAULT 0,    -- キャッシュ入力（読み込み）
+    cache_write_tokens  bigint       NOT NULL DEFAULT 0,    -- キャッシュ出力（書き込み）
+    requests            bigint       NOT NULL DEFAULT 0,    -- 呼び出し回数
+    updated_at          timestamptz,                        -- 最後に加算した日時
+    reset_at            timestamptz  NOT NULL DEFAULT now() -- 集計開始（最後にゼロに戻した）日時
+);
