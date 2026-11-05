@@ -170,17 +170,19 @@ def available_engines() -> tuple[list[Engine], list[str]]:
     """(使えるエンジン, 警告メッセージ) を返す。"""
     engines: list[Engine] = []
     warnings: list[str] = []
-    models = fetch_lmstudio_models()
-    if models is None:
-        warnings.append(f"LM Studio（{LMSTUDIO_BASE_URL}）に接続できません。ローカル LLM は使えません。")
-    else:
-        engines += _local_engines("lmstudio", models)
-    if OLLAMA_BASE_URL:
-        models = fetch_ollama_models()
-        if models is None:
-            warnings.append(f"Ollama（{OLLAMA_BASE_URL}）に接続できません。Ollama のモデルは使えません。")
-        else:
-            engines += _local_engines("ollama", models)
+    # ---- ローカル LLM（LM Studio / Ollama）への接続は、現在使わないためコメントアウト ----
+    # 再び使う場合は、以下のコメントを外してください（接続先は .env の LMSTUDIO_BASE_URL / OLLAMA_BASE_URL）。
+    # models = fetch_lmstudio_models()
+    # if models is None:
+    #     warnings.append(f"LM Studio（{LMSTUDIO_BASE_URL}）に接続できません。ローカル LLM は使えません。")
+    # else:
+    #     engines += _local_engines("lmstudio", models)
+    # if OLLAMA_BASE_URL:
+    #     models = fetch_ollama_models()
+    #     if models is None:
+    #         warnings.append(f"Ollama（{OLLAMA_BASE_URL}）に接続できません。Ollama のモデルは使えません。")
+    #     else:
+    #         engines += _local_engines("ollama", models)
     missing = []
     for provider, (name, key_var, models) in CLOUD_PROVIDERS.items():
         if provider_available(provider):

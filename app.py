@@ -269,6 +269,37 @@ with translate_tab:
     with st.expander("過去訳（RAG）の検索対象 ― 前年の文書に絞り込むと精度が上がります"):
         tr_filter = doc_filter_inputs("tr_filter")
 
+    # 絞り込みの結果（条件がなければ全文書）を常に表示する
+    with st.container(border=True):
+        try:
+            with connect() as conn:
+                tr_doc_ids = resolve_doc_ids(conn, tr_filter)
+                all_docs = list_documents(conn)
+        except Exception as exc:
+            tr_doc_ids, all_docs = None, []
+            st.error(f"データベースに接続できません: {exc}")
+        if tr_doc_ids is None:
+            target_docs = all_docs
+        else:
+            id_set = set(tr_doc_ids)
+            target_docs = [d for d in all_docs if d["id"] in id_set]
+        n_pairs = sum(d["segments"] for d in target_docs)
+        if tr_doc_ids is None:
+            st.markdown(f"**過去訳の検索対象：全文書**（{len(target_docs):,} 文書・対訳 {n_pairs:,} 組）")
+        elif not target_docs:
+            st.markdown("**過去訳の検索対象：該当する文書がありません**")
+            st.caption("このまま翻訳すると、過去訳を使わずに翻訳します。絞り込み条件を見直してください。")
+        else:
+            st.markdown(f"**過去訳の検索対象：絞り込み結果 {len(target_docs):,} 文書**（対訳 {n_pairs:,} 組）")
+        if target_docs:
+            st.dataframe(
+                pd.DataFrame([{
+                    "ファイル名": d["doc_key"], "案件名": d["title"] or "", "顧客名": d["client"] or "",
+                    "タグ": "、".join(d["tags"] or []), "対訳数": d["segments"],
+                } for d in target_docs]),
+                hide_index=True, height=min(35 * (len(target_docs) + 1) + 3, 220),
+            )
+
     try:
         with connect() as conn:
             glossary_clients = sorted(set(list_glossary_clients(conn)) - {COMMON})
