@@ -95,21 +95,22 @@ CREATE TRIGGER trg_segments_updated_at
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
 -- ---------------------------------------------------------------------
--- 用語集（顧客ごと。client = '' は全顧客共通）
+-- 用語集（共通 → 会社 → 媒体の 3 段階。client = '' は全顧客共通、medium = '' は会社全体）
 --   ※既存の DB には、アプリ起動時に自動で作成される（glossary.py の ensure_glossary_table）
 -- ---------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS glossary_terms (
     id          bigserial    PRIMARY KEY,
     client      text         NOT NULL DEFAULT '',   -- 顧客名（'' = 共通）
+    medium      text         NOT NULL DEFAULT '',   -- 媒体名（'' = 会社全体。例：統合報告書）
     en          text         NOT NULL,              -- 英語の用語
     ja          text         NOT NULL,              -- 日本語の訳語
     note        text,                               -- 備考
     required    boolean      NOT NULL DEFAULT true, -- true=必須（毎回この訳語）/ false=参考
     created_at  timestamptz  NOT NULL DEFAULT now(),
     updated_at  timestamptz  NOT NULL DEFAULT now(),
-    UNIQUE (client, en, ja)
+    CONSTRAINT glossary_terms_client_medium_en_ja_key UNIQUE (client, medium, en, ja)
 );
-CREATE INDEX IF NOT EXISTS idx_glossary_terms_client ON glossary_terms (client);
+CREATE INDEX IF NOT EXISTS idx_glossary_terms_client_medium ON glossary_terms (client, medium);
 
 DROP TRIGGER IF EXISTS trg_glossary_terms_updated_at ON glossary_terms;
 CREATE TRIGGER trg_glossary_terms_updated_at

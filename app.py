@@ -14,8 +14,9 @@ from documents import (
     list_tags, list_titles, update_document,
 )
 from glossary import (
-    COMMON, Term, client_label, count_terms, delete_client_terms, ensure_glossary_table,
-    get_terms, glossary_to_excel, list_glossary_clients, load_glossary, read_glossary_file, save_terms,
+    COMMON, COMPANY_WIDE, Term, client_label, count_terms, delete_terms, ensure_glossary_table,
+    get_terms, glossary_label, glossary_scope_label, glossary_to_excel, list_glossaries, load_glossary,
+    read_glossary_file, save_terms,
 )
 from glossary_extract import (
     COLUMNS, build_candidates, candidates_to_excel, candidates_to_records, extract_short_pairs,
@@ -148,6 +149,48 @@ def resolve_doc_ids(conn, f: dict) -> list[int] | None:
                              tag_mode="all" if f["tag_mode"] == "すべて含む" else "any")
 
 
+def show_target_docs(f: dict | None, heading: str, empty_note: str) -> list[int] | None:
+    """絞り込みの結果（条件がなければ全文書）を枠内に常に表示し、対象文書の id を返す。
+
+    f=None は「検索対象文書なし」（[] を返す）。DB に接続できないときは None。
+    """
+    with st.container(border=True):
+        if f is None:
+            st.markdown(f"**{heading}：なし**（過去訳を検索せず、用語集だけで翻訳します）")
+            st.caption("すべての文が「新規」として LLM に送られます。"
+                       "「PLaMo翻訳」「TranslateGemma」は用語集を使わないため、原文だけで翻訳します。")
+            return []
+        try:
+            with connect() as conn:
+                doc_ids = resolve_doc_ids(conn, f)
+                all_docs = list_documents(conn)
+        except Exception as exc:
+            st.error(f"データベースに接続できません: {exc}")
+            return None
+        if doc_ids is None:
+            target_docs = all_docs
+        else:
+            id_set = set(doc_ids)
+            target_docs = [d for d in all_docs if d["id"] in id_set]
+        n_pairs = sum(d["segments"] for d in target_docs)
+        if doc_ids is None:
+            st.markdown(f"**{heading}：全文書**（{len(target_docs):,} 文書・対訳 {n_pairs:,} 組）")
+        elif not target_docs:
+            st.markdown(f"**{heading}：該当する文書がありません**")
+            st.caption(empty_note)
+        else:
+            st.markdown(f"**{heading}：絞り込み結果 {len(target_docs):,} 文書**（対訳 {n_pairs:,} 組）")
+        if target_docs:
+            st.dataframe(
+                pd.DataFrame([{
+                    "ファイル名": d["doc_key"], "案件名": d["title"] or "", "顧客名": d["client"] or "",
+                    "タグ": "、".join(d["tags"] or []), "対訳数": d["segments"],
+                } for d in target_docs]),
+                hide_index=True, height=min(35 * (len(target_docs) + 1) + 3, 220),
+            )
+    return doc_ids
+
+
 st.title("RAG Translation App")
 if msg := st.session_state.pop("flash", None):
     st.success(msg)
@@ -172,6 +215,9 @@ with search_tab:
 
     with st.expander("検索対象の絞り込み（顧客名・案件名・タグ）"):
         search_filter = doc_filter_inputs("filter")
+    # 絞り込みの結果（条件がなければ全文書）を常に表示する
+    show_target_docs(search_filter, "検索対象",
+                     "このまま検索しても結果は表示されません。絞り込み条件を見直してください。")
 
     if st.button("検索", type="primary"):
         if not query.strip():
@@ -268,55 +314,50 @@ with translate_tab:
         get_engines.clear()
         st.rerun()
 
-    with st.expander("過去訳（RAG）の検索対象 ― 前年の文書に絞り込むと精度が上がります"):
+    tr_scope = st.radio(
+        "過去訳（RAG）の検索", ["検索する", "検索対象文書なし（過去訳を使わず、用語集だけで翻訳）"],
+        horizontal=True, key="tr_scope",
+        help="「検索対象文書なし」にすると前年訳・過去訳を一切使わず、用語集だけを渡して翻訳します。",
+    )
+    no_rag = tr_scope != "検索する"
+    # 「検索対象文書なし」でも絞り込み欄は残す（切り替えても条件が消えず、用語集の初期値にも使うため）
+    with st.expander("過去訳（RAG）の検索対象 ― 前年の文書に絞り込むと精度が上がります"
+                     + ("（「検索対象文書なし」のため使いません）" if no_rag else "")):
         tr_filter = doc_filter_inputs("tr_filter")
-
-    # 絞り込みの結果（条件がなければ全文書）を常に表示する
-    with st.container(border=True):
-        try:
-            with connect() as conn:
-                tr_doc_ids = resolve_doc_ids(conn, tr_filter)
-                all_docs = list_documents(conn)
-        except Exception as exc:
-            tr_doc_ids, all_docs = None, []
-            st.error(f"データベースに接続できません: {exc}")
-        if tr_doc_ids is None:
-            target_docs = all_docs
-        else:
-            id_set = set(tr_doc_ids)
-            target_docs = [d for d in all_docs if d["id"] in id_set]
-        n_pairs = sum(d["segments"] for d in target_docs)
-        if tr_doc_ids is None:
-            st.markdown(f"**過去訳の検索対象：全文書**（{len(target_docs):,} 文書・対訳 {n_pairs:,} 組）")
-        elif not target_docs:
-            st.markdown("**過去訳の検索対象：該当する文書がありません**")
-            st.caption("このまま翻訳すると、過去訳を使わずに翻訳します。絞り込み条件を見直してください。")
-        else:
-            st.markdown(f"**過去訳の検索対象：絞り込み結果 {len(target_docs):,} 文書**（対訳 {n_pairs:,} 組）")
-        if target_docs:
-            st.dataframe(
-                pd.DataFrame([{
-                    "ファイル名": d["doc_key"], "案件名": d["title"] or "", "顧客名": d["client"] or "",
-                    "タグ": "、".join(d["tags"] or []), "対訳数": d["segments"],
-                } for d in target_docs]),
-                hide_index=True, height=min(35 * (len(target_docs) + 1) + 3, 220),
-            )
+    # 絞り込みの結果（条件がなければ全文書／検索しない場合は「なし」）を常に表示する
+    show_target_docs(None if no_rag else tr_filter, "過去訳の検索対象",
+                     "このまま翻訳すると、過去訳を使わずに翻訳します。絞り込み条件を見直してください。")
 
     try:
         with connect() as conn:
-            glossary_clients = sorted(set(list_glossary_clients(conn)) - {COMMON})
+            g_glossaries = list_glossaries(conn)
             term_counts = count_terms(conn)
     except Exception:
-        glossary_clients, term_counts = [], {}
-    default_client = tr_filter["clients"][0] if len(tr_filter["clients"]) == 1 else None
+        g_glossaries, term_counts = [], {}
+    glossary_clients = sorted({c for c, _ in g_glossaries} - {COMMON})
+    f_clients = tr_filter["clients"]
+    default_client = f_clients[0] if len(f_clients) == 1 else None
     g_options = [COMMON] + glossary_clients
-    g_client = st.selectbox(
-        "用語集", g_options,
+    g1, g2 = st.columns(2)
+    g_client = g1.selectbox(
+        "用語集（顧客）", g_options,
         index=g_options.index(default_client) if default_client in g_options else 0,
-        format_func=lambda c: (f"{c}（＋共通）" if c else "共通のみ") + f"　{term_counts.get(c, 0)}語",
-        key="tr_glossary",
+        format_func=lambda c: (f"{c}（＋共通）" if c else "共通のみ") + f"　{term_counts.get((c, ''), 0)}語",
+        key=f"tr_glossary_{default_client}",  # 絞り込みの顧客が変わったら初期値を選び直す
         help="各文に含まれる用語だけを LLM に渡します。顧客の用語集を選ぶと共通の用語集も併用し、"
              "同じ用語は顧客の訳語を優先します。",
+    )
+    g_media = [m for c, m in g_glossaries if c == g_client and m]
+    f_tags = tr_filter["tags"]
+    default_medium = next((m for m in g_media if m in f_tags), COMPANY_WIDE)  # タグと同じ名前の媒体を初期値に
+    m_options = [COMPANY_WIDE] + g_media
+    g_medium = g2.selectbox(
+        "媒体", m_options, index=m_options.index(default_medium),
+        format_func=lambda m: f"{m}（＋会社全体）　{term_counts.get((g_client, m), 0)}語" if m
+        else "指定しない（会社全体の用語集）",
+        key=f"tr_medium_{g_client}_{default_medium}", disabled=not g_media,
+        help="媒体別の用語集がある顧客だけ選べます。媒体を選ぶと「共通＋会社全体＋媒体」の用語集を重ねて使い、"
+             "同じ用語は 媒体 ＞ 会社 ＞ 共通 の順に優先します。",
     )
 
     with st.expander("詳細設定"):
@@ -335,12 +376,12 @@ with translate_tab:
         bar = st.progress(0.0, text="開始…")
         try:
             with connect() as conn:
-                doc_ids = resolve_doc_ids(conn, tr_filter)
-                if doc_ids == []:
+                doc_ids = [] if no_rag else resolve_doc_ids(conn, tr_filter)
+                if doc_ids == [] and not no_rag:
                     st.warning("絞り込み条件に合う文書がないため、過去訳を使わずに翻訳します。")
                 settings = TranslationSettings(
                     lang=lang, engines=[by_label[x] for x in sel_labels], doc_ids=doc_ids,
-                    glossary=load_glossary(conn, g_client or None),
+                    glossary=load_glossary(conn, g_client or None, g_medium or None),
                     edit_threshold=edit_th, ref_threshold=ref_th, ref_count=ref_count,
                     reuse_exact=reuse_exact,
                 )
@@ -348,8 +389,9 @@ with translate_tab:
                                        progress=lambda f, m: bar.progress(min(f, 1.0), text=m))
             meta = {
                 "入力": input_name,
-                "過去訳の検索対象": "全文書" if doc_ids is None else f"{len(doc_ids)} 文書（絞り込みあり）",
-                "用語集": f"{g_client}（＋共通）" if g_client else "共通のみ",
+                "過去訳の検索対象": ("なし（用語集だけで翻訳）" if no_rag else "全文書" if doc_ids is None
+                                     else f"{len(doc_ids)} 文書（絞り込みあり）"),
+                "用語集": glossary_scope_label(g_client, g_medium),
             }
             data = results_to_excel(rows, settings, meta)
         except Exception as exc:
@@ -474,22 +516,46 @@ with ingest_tab:
 with glossary_tab:
     try:
         with connect() as conn:
-            gl_clients = list_glossary_clients(conn)
+            gl_glossaries = list_glossaries(conn)
             doc_clients = list_clients(conn)
             gl_counts = count_terms(conn)
     except Exception as exc:
-        gl_clients, doc_clients, gl_counts = [], [], {}
+        gl_glossaries, doc_clients, gl_counts = [], [], {}
         st.error(f"データベースに接続できません: {exc}")
-    gl_options = [COMMON] + sorted((set(gl_clients) | set(doc_clients)) - {COMMON})
-    gl_client = st.selectbox(
-        "用語集（顧客）", gl_options,
-        format_func=lambda c: f"{client_label(c)}　{gl_counts.get(c, 0)}語",
+    gl_options = [COMMON] + sorted(({c for c, _ in gl_glossaries} | set(doc_clients)) - {COMMON})
+
+    def _client_option(c: str) -> str:
+        n_media = sum(1 for cc, m in gl_glossaries if cc == c and m)
+        extra = f"（媒体別 {n_media}）" if n_media else ""
+        return f"{client_label(c)}　{gl_counts.get((c, COMPANY_WIDE), 0)}語{extra}"
+
+    k1, k2 = st.columns(2)
+    gl_client = (k1.selectbox(
+        "用語集（顧客）", gl_options, format_func=_client_option,
         accept_new_options=True, key="gl_client",
         placeholder="選択、または新しい顧客名を入力して Enter",
-    ) or COMMON
-    st.caption("「（共通）」の用語集はすべての翻訳で使われます。顧客の用語集に同じ英語の用語があれば、"
-               "顧客の訳語が優先されます。区分「必須」は毎回この訳語を使う用語（自動チェックの対象）、"
+    ) or COMMON).strip()
+    gl_media = [m for c, m in gl_glossaries if c == gl_client and m]
+    if gl_client == COMMON:  # 共通の用語集には媒体はない
+        k2.selectbox("媒体", ["（共通の用語集には媒体はありません）"], disabled=True, key="gl_medium_common")
+        gl_medium = COMPANY_WIDE
+    else:
+        gl_medium = (k2.selectbox(
+            "媒体", [COMPANY_WIDE] + gl_media,
+            format_func=lambda m: f"{m}　{gl_counts.get((gl_client, m), 0)}語" if m else "指定しない（会社全体）",
+            accept_new_options=True, key=f"gl_medium_{gl_client}",
+            placeholder="選択、または新しい媒体名を入力して Enter",
+            help="特定の媒体（統合報告書など）だけ訳語を変える場合に使います。",
+        ) or COMPANY_WIDE).strip()
+    gl_label = glossary_label(gl_client, gl_medium)
+    st.caption("用語集は「共通 → 会社 → 媒体」の 3 段階です。「（共通）」はすべての翻訳で使われ、"
+               "同じ英語の用語は 媒体 ＞ 会社 ＞ 共通 の順に優先されます。"
+               "区分「必須」は毎回この訳語を使う用語（自動チェックの対象）、"
                "「参考」は文脈に合えば使う訳語の候補です。")
+    if gl_medium:
+        st.info(f"媒体「{gl_medium}」の用語集です。翻訳では「共通＋{gl_client}（会社全体）＋この媒体」を重ねて使います。"
+                "会社全体の用語集と訳語が違う用語だけを登録すれば十分です。"
+                "媒体名は、文書のタグと同じ名前にしておくと、翻訳タブで自動的に選ばれます。")
     version = st.session_state.get("gl_version", 0)
     gl_view = st.radio("操作", ["用語集を編集", "対訳表から用語を抽出"], horizontal=True, key="gl_view",
                        label_visibility="collapsed")
@@ -497,13 +563,13 @@ with glossary_tab:
     if gl_view == "用語集を編集":
         try:
             with connect() as conn:
-                current_terms = get_terms(conn, gl_client)
+                current_terms = get_terms(conn, gl_client, gl_medium)
         except Exception:
             current_terms = []
         gl_df = pd.DataFrame([{"en": t.en, "ja": t.ja, "required": t.required, "note": t.note or ""}
                               for t in current_terms], columns=["en", "ja", "required", "note"])
         edited = st.data_editor(
-            gl_df, num_rows="dynamic", hide_index=True, key=f"gl_editor_{gl_client}_{version}",
+            gl_df, num_rows="dynamic", hide_index=True, key=f"gl_editor_{gl_client}_{gl_medium}_{version}",
             column_config={
                 "en": st.column_config.TextColumn("英語（en）", required=True, width="large"),
                 "ja": st.column_config.TextColumn("日本語（ja）", required=True, width="large"),
@@ -521,16 +587,16 @@ with glossary_tab:
                      if str(r["en"]).strip() and str(r["ja"]).strip()]
             try:
                 with connect() as conn:
-                    n = save_terms(conn, gl_client, terms, replace=True)
+                    n = save_terms(conn, gl_client, terms, replace=True, medium=gl_medium)
             except Exception as exc:
                 st.error(f"保存に失敗しました: {exc}")
             else:
                 st.session_state["gl_version"] = version + 1
-                flash(f"{client_label(gl_client)} の用語集を保存しました（{n:,} 語）。")
+                flash(f"{gl_label} の用語集を保存しました（{n:,} 語）。")
                 st.rerun()
         b2.download_button(
             "Excel でダウンロード", data=glossary_to_excel(current_terms),
-            file_name=f"用語集_{client_label(gl_client)}.xlsx", key="gl_download",
+            file_name=f"用語集_{gl_label}.xlsx", key="gl_download",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             disabled=not current_terms,
         )
@@ -555,31 +621,31 @@ with glossary_tab:
                                                for t in imported[:20]]), hide_index=True)
                     gl_mode = st.radio("取り込み方法", ["追加・更新（今の用語は残す）", "置き換え（今の用語を削除）"],
                                        horizontal=True, key="gl_import_mode")
-                    if st.button(f"{client_label(gl_client)} に取り込む", key="gl_import"):
+                    if st.button(f"{gl_label} に取り込む", key="gl_import"):
                         try:
                             with connect() as conn:
                                 n = save_terms(conn, gl_client,
                                                [Term(t.en, t.ja, gl_client, t.note, t.required) for t in imported],
-                                               replace=gl_mode.startswith("置き換え"))
+                                               replace=gl_mode.startswith("置き換え"), medium=gl_medium)
                         except Exception as exc:
                             st.error(f"取り込みに失敗しました: {exc}")
                         else:
                             st.session_state["gl_version"] = version + 1
-                            flash(f"{client_label(gl_client)} の用語集に {n:,} 語を取り込みました。")
+                            flash(f"{gl_label} の用語集に {n:,} 語を取り込みました。")
                             st.rerun()
 
         with st.expander("この用語集を削除"):
-            gl_confirm = st.checkbox(f"{client_label(gl_client)} の用語 {len(current_terms):,} 語をすべて削除します",
-                                     key=f"gl_confirm_{gl_client}")
+            gl_confirm = st.checkbox(f"{gl_label} の用語 {len(current_terms):,} 語をすべて削除します",
+                                     key=f"gl_confirm_{gl_client}_{gl_medium}")
             if st.button("削除する", disabled=not (gl_confirm and current_terms), key="gl_delete"):
                 with connect() as conn:
-                    delete_client_terms(conn, gl_client)
+                    delete_terms(conn, gl_client, gl_medium)
                 st.session_state["gl_version"] = version + 1
-                flash(f"{client_label(gl_client)} の用語集を削除しました。")
+                flash(f"{gl_label} の用語集を削除しました。")
                 st.rerun()
 
     else:  # 対訳表から用語を抽出
-        st.caption(f"対訳から用語の候補を抽出し、{client_label(gl_client)} の用語集と照合します。"
+        st.caption(f"対訳から用語の候補を抽出し、{gl_label} の用語集と照合します。"
                    "候補を確認して「採用」に印を付け、用語集に取り込みます。")
         gx_src = st.radio("対訳の取得元", ["登録済みの文書（データベース）", "対訳表ファイル（.xlsx / .csv）"],
                           horizontal=True, key="gx_src")
@@ -623,7 +689,7 @@ with glossary_tab:
                         pairs = pairs_from_db(conn, resolve_doc_ids(conn, gx_filter))
                     else:
                         pairs = pairs_from_rows(gx_pairs_source)
-                    existing = load_glossary(conn, gl_client or None)
+                    existing = load_glossary(conn, gl_client or None, gl_medium or None)
                 short = extract_short_pairs(pairs, max_words=max_words, min_count=min_count) if use_short else []
                 llm_cands, llm_errors = [], []
                 if use_llm and gx_engine_label:
@@ -640,7 +706,7 @@ with glossary_tab:
                 bar.empty()
                 st.session_state["gx_result"] = {
                     "records": candidates_to_records(cands), "pairs": len(pairs), "errors": llm_errors,
-                    "client": gl_client, "run": pd.Timestamp.now().strftime("%H%M%S"),
+                    "label": gl_label, "run": pd.Timestamp.now().strftime("%H%M%S"),
                 }
 
         gx = st.session_state.get("gx_result")
@@ -654,8 +720,8 @@ with glossary_tab:
             k[3].metric("登録済み", f"{status.get('登録済み', 0):,} 語")
             for err in gx["errors"][:3]:
                 st.warning(f"LLM の呼び出しで一部エラー: {err}")
-            if gx["client"] != gl_client:
-                st.info(f"この候補は {client_label(gx['client'])} の用語集と照合した結果です。")
+            if gx["label"] != gl_label:
+                st.info(f"この候補は {gx['label']} の用語集と照合した結果です。")
             st.caption("「採用」に印を付けた行を取り込みます（初期値：新規で、一貫性80%以上かつ2回以上出現）。"
                        "一貫性＝英文に用語が出てくる対訳のうち、和文に訳語が使われている割合。"
                        "低い用語は文脈で訳し分けている可能性があるため、「参考」にするか見送ってください。"
@@ -675,24 +741,24 @@ with glossary_tab:
             )
             adopted = gx_edited[gx_edited["採用"] == True]  # noqa: E712
             c1, c2 = st.columns([2, 3])
-            if c1.button(f"採用した {len(adopted):,} 語を {client_label(gl_client)} に取り込む", type="primary",
+            if c1.button(f"採用した {len(adopted):,} 語を {gl_label} に取り込む", type="primary",
                          disabled=adopted.empty, key="gx_import"):
                 terms = [Term(str(r["en"]).strip(), str(r["ja"]).strip(), gl_client, None, r["区分"] != "参考")
                          for r in adopted.to_dict("records") if str(r["en"]).strip() and str(r["ja"]).strip()]
                 try:
                     with connect() as conn:
-                        n = save_terms(conn, gl_client, terms, replace=False)
+                        n = save_terms(conn, gl_client, terms, replace=False, medium=gl_medium)
                 except Exception as exc:
                     st.error(f"取り込みに失敗しました: {exc}")
                 else:
                     st.session_state["gl_version"] = version + 1
                     st.session_state.pop("gx_result", None)
-                    flash(f"{client_label(gl_client)} の用語集に {n:,} 語を取り込みました。")
+                    flash(f"{gl_label} の用語集に {n:,} 語を取り込みました。")
                     st.rerun()
             c2.download_button(
                 "候補一覧を Excel でダウンロード（確認してから取り込む場合）",
                 data=candidates_to_excel(gx_edited.to_dict("records")),
-                file_name=f"用語候補_{client_label(gl_client)}.xlsx", key="gx_download",
+                file_name=f"用語候補_{gl_label}.xlsx", key="gx_download",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 

@@ -23,7 +23,7 @@ from datetime import datetime
 from typing import Callable
 
 from common import Lang, detect_lang
-from glossary import Term, match_terms
+from glossary import Term, glossary_label, match_terms
 from llm import STYLE_LABEL, Engine, chat, complete
 from search import hybrid_search
 
@@ -553,10 +553,11 @@ def results_to_excel(rows: list[RowResult], st: TranslationSettings, meta: dict[
         row_cells[0].font = Font(bold=True)
 
     gl = wb.create_sheet("使用した用語")
-    gl.append([src, tgt, "区分", "顧客"])
-    used = {(t.source(st.lang), t.target(st.lang), t.kind, t.client) for r in rows for t in r.terms}
-    for s, t, k, c in sorted(used):
-        gl.append([s, t, k, c or "（共通）"])
+    gl.append([src, tgt, "区分", "用語集"])
+    used = {(t.source(st.lang), t.target(st.lang), t.kind, glossary_label(t.client, t.medium))
+            for r in rows for t in r.terms}
+    for s, t, k, label in sorted(used):
+        gl.append([s, t, k, label])
     for col, w in zip("ABCD", (40, 40, 8, 24)):
         gl.column_dimensions[col].width = w
 

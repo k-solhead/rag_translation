@@ -1,14 +1,17 @@
-"""用語集（顧客ごと）の DB 管理と、文ごとの用語の抽出。
+"""用語集（共通・顧客・媒体ごと）の DB 管理と、文ごとの用語の抽出。
 
 glossary_terms テーブル
     client : 顧客名（空文字 '' = 全顧客共通の用語集）
+    medium : 媒体名（空文字 '' = その顧客の会社全体の用語集。例：統合報告書、サステナビリティレポート）
     en     : 英語の用語
     ja     : 日本語の訳語
     note     : 備考（任意）
     required : True＝必須（必ずこの訳語を使う）／False＝参考（文脈に合えば使う）
 
-翻訳時は「共通」＋「選んだ顧客」の用語集を使い、各文に含まれる用語だけを LLM に渡す。
-同じ用語が両方にある場合は、顧客の用語集を優先する。
+用語集は「共通 → 会社 → 媒体」の 3 段階。翻訳時は「共通」＋「選んだ顧客（会社全体）」
+＋「選んだ媒体」の用語集を重ねて使い、各文に含まれる用語だけを LLM に渡す。
+同じ英語の用語が複数にある場合は、媒体 ＞ 会社 ＞ 共通 の順に優先する
+（媒体の用語集には、会社の用語集と訳語が違う用語だけを登録すればよい）。
 必須の用語は「必ず使う訳語」としてプロンプトに入れ、自動チェック（用語未使用）の対象にする。
 参考の用語は「訳語の候補」としてだけ示し、チェックの対象にしない。
 """
@@ -22,20 +25,22 @@ from dataclasses import dataclass
 
 COMMON = ""  # 共通用語集を表す client の値
 COMMON_LABEL = "（共通）"
+COMPANY_WIDE = ""  # 会社全体（媒体を指定しない）を表す medium の値
 
 GLOSSARY_DDL = """
 CREATE TABLE IF NOT EXISTS glossary_terms (
     id          bigserial    PRIMARY KEY,
     client      text         NOT NULL DEFAULT '',   -- 顧客名（'' = 共通）
+    medium      text         NOT NULL DEFAULT '',   -- 媒体名（'' = 会社全体）
     en          text         NOT NULL,
     ja          text         NOT NULL,
     note        text,
     required    boolean      NOT NULL DEFAULT true, -- true=必須 / false=参考
     created_at  timestamptz  NOT NULL DEFAULT now(),
     updated_at  timestamptz  NOT NULL DEFAULT now(),
-    UNIQUE (client, en, ja)
+    CONSTRAINT glossary_terms_client_medium_en_ja_key UNIQUE (client, medium, en, ja)
 );
-CREATE INDEX IF NOT EXISTS idx_glossary_terms_client ON glossary_terms (client);
+CREATE INDEX IF NOT EXISTS idx_glossary_terms_client_medium ON glossary_terms (client, medium);
 DROP TRIGGER IF EXISTS trg_glossary_terms_updated_at ON glossary_terms;
 CREATE TRIGGER trg_glossary_terms_updated_at
     BEFORE UPDATE ON glossary_terms
@@ -62,6 +67,7 @@ class Term:
     client: str = COMMON
     note: str | None = None
     required: bool = True
+    medium: str = COMPANY_WIDE
 
     @property
     def kind(self) -> str:
@@ -112,6 +118,22 @@ def client_label(client: str) -> str:
     return client or COMMON_LABEL
 
 
+def glossary_label(client: str, medium: str = COMPANY_WIDE) -> str:
+    """画面表示用の用語集の名前（例：（共通）／アサヒ／アサヒ・統合報告書）。"""
+    if client and medium:
+        return f"{client}・{medium}"
+    return client_label(client)
+
+
+def glossary_scope_label(client: str | None, medium: str | None = None) -> str:
+    """翻訳で重ねて使う用語集の説明（例：アサヒ・統合報告書（＋会社全体＋共通））。"""
+    if not client:
+        return "共通のみ"
+    if medium:
+        return f"{client}・{medium}（＋会社全体＋共通）"
+    return f"{client}（＋共通）"
+
+
 # ---------------------------------------------------------------------
 # DB 操作
 # ---------------------------------------------------------------------
@@ -125,58 +147,93 @@ def ensure_glossary_table(conn) -> None:
     exists = conn.execute("SELECT to_regclass('public.glossary_terms') IS NOT NULL").fetchone()[0]
     if not exists:
         conn.execute(GLOSSARY_DDL)
-    # 後から追加した列（必須／参考）
+    # 後から追加した列（必須／参考、媒体）
     conn.execute("ALTER TABLE glossary_terms ADD COLUMN IF NOT EXISTS required boolean NOT NULL DEFAULT true")
+    conn.execute("ALTER TABLE glossary_terms ADD COLUMN IF NOT EXISTS medium text NOT NULL DEFAULT ''")
+    # 一意制約を (client, en, ja) → (client, medium, en, ja) に付け替える（既存のデータは medium = '' になる）
+    names = {r[0] for r in conn.execute(
+        "SELECT conname FROM pg_constraint WHERE conrelid = 'glossary_terms'::regclass AND contype = 'u'")}
+    if "glossary_terms_client_medium_en_ja_key" not in names:
+        if "glossary_terms_client_en_ja_key" in names:
+            conn.execute("ALTER TABLE glossary_terms DROP CONSTRAINT glossary_terms_client_en_ja_key")
+        conn.execute("ALTER TABLE glossary_terms ADD CONSTRAINT glossary_terms_client_medium_en_ja_key "
+                     "UNIQUE (client, medium, en, ja)")
+    conn.execute("DROP INDEX IF EXISTS idx_glossary_terms_client")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_glossary_terms_client_medium ON glossary_terms (client, medium)")
     conn.commit()
 
 
+def list_glossaries(conn) -> list[tuple[str, str]]:
+    """用語が登録されている (顧客名, 媒体名) の組（共通 ('', '') を含む）。"""
+    return [tuple(r) for r in conn.execute(
+        "SELECT DISTINCT client, medium FROM glossary_terms ORDER BY client, medium")]
+
+
 def list_glossary_clients(conn) -> list[str]:
-    """用語が登録されている顧客名（共通 '' を含む）。"""
+    """用語が登録されている顧客名（共通 '' を含む。媒体だけに用語がある顧客も含む）。"""
+    return sorted({c for c, _ in list_glossaries(conn)})
+
+
+def list_media(conn, client: str) -> list[str]:
+    """その顧客で用語が登録されている媒体名（会社全体 '' は含まない）。"""
     return [r[0] for r in conn.execute(
-        "SELECT DISTINCT client FROM glossary_terms ORDER BY client")]
+        "SELECT DISTINCT medium FROM glossary_terms WHERE client = %s AND medium <> '' ORDER BY medium",
+        (client,))]
 
 
-def count_terms(conn) -> dict[str, int]:
-    return dict(conn.execute("SELECT client, count(*) FROM glossary_terms GROUP BY client"))
+def count_terms(conn) -> dict[tuple[str, str], int]:
+    """(顧客名, 媒体名) ごとの用語数。"""
+    return {(c, m): n for c, m, n in conn.execute(
+        "SELECT client, medium, count(*) FROM glossary_terms GROUP BY client, medium")}
 
 
-def get_terms(conn, client: str) -> list[Term]:
+def get_terms(conn, client: str, medium: str = COMPANY_WIDE) -> list[Term]:
     rows = conn.execute(
-        "SELECT en, ja, client, note, required FROM glossary_terms WHERE client = %s ORDER BY en, ja",
-        (client,))
+        "SELECT en, ja, client, note, required, medium FROM glossary_terms"
+        " WHERE client = %s AND medium = %s ORDER BY en, ja",
+        (client, medium if client else COMPANY_WIDE))
     return [Term(*r) for r in rows]
 
 
-def save_terms(conn, client: str, terms: list[Term], *, replace: bool) -> int:
-    """用語を登録する。replace=True ならその顧客の用語集を丸ごと置き換える。"""
+def save_terms(conn, client: str, terms: list[Term], *, replace: bool, medium: str = COMPANY_WIDE) -> int:
+    """用語を登録する。replace=True ならその用語集（顧客・媒体）を丸ごと置き換える。"""
+    medium = _clean(medium) if client else COMPANY_WIDE  # 共通の用語集に媒体はない
     terms = [t for t in terms if _clean(t.en) and _clean(t.ja)]
     with conn.transaction():
         if replace:
-            conn.execute("DELETE FROM glossary_terms WHERE client = %s", (client,))
+            conn.execute("DELETE FROM glossary_terms WHERE client = %s AND medium = %s", (client, medium))
         with conn.cursor() as cur:
             cur.executemany(
                 """
-                INSERT INTO glossary_terms (client, en, ja, note, required) VALUES (%s, %s, %s, %s, %s)
-                ON CONFLICT (client, en, ja) DO UPDATE
+                INSERT INTO glossary_terms (client, medium, en, ja, note, required) VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (client, medium, en, ja) DO UPDATE
                     SET note = COALESCE(EXCLUDED.note, glossary_terms.note), required = EXCLUDED.required
                 """,
-                [(client, _clean(t.en), _clean(t.ja), (t.note or "").strip() or None, bool(t.required))
+                [(client, medium, _clean(t.en), _clean(t.ja), (t.note or "").strip() or None, bool(t.required))
                  for t in terms],
             )
     return len(terms)
 
 
-def delete_client_terms(conn, client: str) -> None:
-    conn.execute("DELETE FROM glossary_terms WHERE client = %s", (client,))
+def delete_terms(conn, client: str, medium: str = COMPANY_WIDE) -> None:
+    """その用語集（顧客・媒体）の用語をすべて削除する。媒体を指定しなければ会社全体の用語集だけ。"""
+    conn.execute("DELETE FROM glossary_terms WHERE client = %s AND medium = %s",
+                 (client, medium if client else COMPANY_WIDE))
+    conn.commit()
 
 
-def load_glossary(conn, client: str | None) -> list[Term]:
-    """翻訳に使う用語集（共通＋顧客）。同じ原語は顧客の用語集を優先する。"""
-    terms = get_terms(conn, COMMON)
+def load_glossary(conn, client: str | None, medium: str | None = None) -> list[Term]:
+    """翻訳に使う用語集（共通＋会社全体＋媒体）。同じ英語の用語は 媒体 ＞ 会社 ＞ 共通 の順に優先する。"""
+    layers = [get_terms(conn, COMMON)]
     if client:
-        own = get_terms(conn, client)
-        own_en = {t.en.lower() for t in own}
-        terms = own + [t for t in terms if t.en.lower() not in own_en]
+        layers.append(get_terms(conn, client))
+        if medium:
+            layers.append(get_terms(conn, client, medium))
+    terms: list[Term] = []
+    seen: set[str] = set()
+    for layer in reversed(layers):  # 優先度の高い順
+        terms += [t for t in layer if t.en.lower() not in seen]
+        seen |= {t.en.lower() for t in layer}
     return terms
 
 
