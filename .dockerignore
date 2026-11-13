@@ -1,0 +1,13 @@
+.git
+.venv
+__pycache__
+*.py[oc]
+.env
+.env.example
+sample
+*.xlsx
+*.csv
+uv.lock
+build
+dist
+*.egg-info
